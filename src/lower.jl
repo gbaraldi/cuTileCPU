@@ -155,6 +155,32 @@ function _splat_attr(value::T, vec_t) where {T<:Number}
     return Base.fill(value, vec_t)
 end
 
+# Emit a `vector<N × elem_T>` of values `[0, 1, ..., N-1]`. On MLIR ≥ 19
+# we use the native `vector.step` op + `arith.index_cast` to the target
+# integer type. On MLIR 18 (no `vector.step`) we fall back to
+# `arith.constant dense<[0..N-1]>` parsed via text — the typed
+# `DenseElementsAttribute(::Vector{Int64})` overload builds a TensorType
+# shape that can't be retargeted at a VectorType, and the generic
+# `DenseElementsAttribute(shaped, ::AbstractArray)` overload reinterprets
+# the array as raw `MlirAttribute*` (→ segfault).
+function _emit_step_vec(vec_t, elem_T::Type, N::Int)
+    if MLIR.MLIR_VERSION[] ≥ v"19"
+        idx_t = IR.IndexType()
+        idx_vec_t = IR.VectorType(1, Int[N], idx_t)
+        step_v = IR.result(_vector.step(; result=idx_vec_t))
+        return idx_vec_t == vec_t ? step_v :
+               IR.result(_arith.index_cast(step_v; out=vec_t))
+    end
+    elem_str = elem_T === Int32  ? "i32" :
+               elem_T === Int64  ? "i64" :
+               elem_T === UInt32 ? "i32" :
+               elem_T === UInt64 ? "i64" :
+               error("_emit_step_vec: unsupported element type $elem_T")
+    arr_str = "[" * join(0:(N-1), ", ") * "]"
+    attr = parse(IR.Attribute, "dense<$arr_str> : vector<$(N)x$(elem_str)>")
+    return IR.result(_arith.constant(; value=attr, result=vec_t))
+end
+
 # MLIR vector type from a cuTile Julia (col-major) tile shape + Julia element
 # type. If the shape is empty (`()` — a 0-D / scalar tile), returns the scalar
 # elem MLIR type instead of `vector<f32>` (which isn't a valid MLIR type).
@@ -385,7 +411,7 @@ remains valid).
 function lower_to_mlir(sci::StructuredIRCode, argtypes::Type;
                        kernel_name::String, n_grid_dims::Int=1,
                        divby_info=nothing, bounds_info=nothing)
-    ctx = Reactant.ReactantContext()
+    ctx = fresh_context()
     mod_ref = Ref{IR.Module}()
     param_julia_types = Type[]
     param_kinds = Symbol[]   # parallel to param_julia_types: :memref or :scalar
@@ -479,10 +505,14 @@ function lower_to_mlir(sci::StructuredIRCode, argtypes::Type;
                     if param_kinds[k] === :memref
                         align = spec_alignment(param_specs[k])
                         align_attr = IR.Attribute(align, IR.Type(Int32))
-                        aligned = IR.result(_memref.assume_alignment(
+                        # `memref.assume_alignment` is a side-effecting op
+                        # with no result on MLIR 18 (the result-returning
+                        # form was added in MLIR 21). Emit the assume and
+                        # keep using the raw arg Value.
+                        _memref.assume_alignment(
                             raw_arg_vals[slot]; alignment=align_attr,
-                        ))
-                        lc.arg_vals[slot] = aligned
+                        )
+                        lc.arg_vals[slot] = raw_arg_vals[slot]
                         # Per-stride divisibility annotations. Plays the
                         # role of cuTile's `apply_arg_assume_predicates!`
                         # for the bytecode target: gives the vectorizer
@@ -495,7 +525,7 @@ function lower_to_mlir(sci::StructuredIRCode, argtypes::Type;
                         # `arg_chain`.
                         argT = widenconst(sci.argtypes[slot])
                         N = ndims(argT)
-                        emit_stride_divby_assumes!(aligned, argT, N)
+                        emit_stride_divby_assumes!(raw_arg_vals[slot], argT, N)
                     else
                         lc.arg_vals[slot] = raw_arg_vals[slot]
                     end
@@ -575,7 +605,7 @@ end
 function lower_to_mlir_spmd(sci::StructuredIRCode, argtypes::Type;
                             kernel_name::String, lane_width::Int=16,
                             alignment::Int=16)
-    ctx = Reactant.ReactantContext()
+    ctx = fresh_context()
     mod_ref = Ref{IR.Module}()
     param_julia_types = Type[]
     param_kinds = Symbol[]
@@ -692,19 +722,19 @@ function lower_to_mlir_spmd(sci::StructuredIRCode, argtypes::Type;
                 c0 = IR.result(_arith.constant(; value=IR.Attribute(Int(0), idx_t)))
                 c1 = IR.result(_arith.constant(; value=IR.Attribute(Int(1), idx_t)))
 
-                # Alignment hints: when alignment > 16, wrap each memref arg
-                # in a `memref.assume_alignment` and use the wrapped Value
-                # downstream. Lowers to `llvm.assume` on the base pointer
-                # so LLVM emits aligned vector load/stores. Skipped at
-                # alignment=16 (Julia GC's default) to keep the IR clean.
+                # Alignment hints: when alignment > 16, emit a
+                # `memref.assume_alignment %arg, N` per memref arg. Lowers
+                # to `llvm.assume` on the base pointer so LLVM emits aligned
+                # vector load/stores. Skipped at alignment=16 (Julia GC's
+                # default) to keep the IR clean. MLIR 18 form is result-
+                # less; we keep the raw arg Value as the downstream binding.
                 if alignment > 16
                     align_attr = IR.Attribute(alignment, IR.Type(Int32))
                     for (k, slot) in enumerate(param_arg_slots)
                         param_kinds[k] === :memref || continue
-                        aligned = IR.result(_memref.assume_alignment(
+                        _memref.assume_alignment(
                             raw_arg_vals[slot]; alignment=align_attr,
-                        ))
-                        lc.arg_vals[slot] = aligned
+                        )
                     end
                 end
 
@@ -733,10 +763,11 @@ function lower_to_mlir_spmd(sci::StructuredIRCode, argtypes::Type;
                     lane_t = mlir_elem_type(lc.lane_idx_type)
                     # Build (0, 1, ..., W-1) as `vector<W × index>` then cast
                     # to the lane idx integer type, then add splat(lane_base+1).
-                    idx_vec_t = IR.VectorType(1, Int[lane_width], idx_t)
-                    step_v = IR.result(_vector.step(; result=idx_vec_t))
+                    # `vector.step` arrived in MLIR 19; on MLIR 18 we emit the
+                    # equivalent `arith.constant dense<0..W-1>` directly in the
+                    # target integer type, skipping the index→iN cast.
                     int_vec_t = IR.VectorType(1, Int[lane_width], lane_t)
-                    step_int = IR.result(_arith.index_cast(step_v; out=int_vec_t))
+                    step_int = _emit_step_vec(int_vec_t, lc.lane_idx_type, lane_width)
                     # base + 1 as scalar (1-based)
                     one_idx = IR.result(_arith.constant(;
                         value=IR.Attribute(Int(1), idx_t)))
@@ -1413,7 +1444,7 @@ end
 # user literal `1` is `i64` but the lane index is the same — but cmpi on
 # `vector<W × i64>` needs the scalar broadcast at i64), insert an int-cast.
 function _broadcast_to_match(v::IR.Value, vec_t)
-    elem_t = IR.eltype(vec_t)
+    elem_t = eltype(vec_t)
     v_t = IR.type(v)
     if v_t != elem_t
         # Scalar element-type mismatch. Common case: index → integer cast.
@@ -1441,7 +1472,7 @@ function emit_mulhii!(lc::LowerCtx, args, @nospecialize(typ))
         error("mulhii: unresolved operands ($(args[1]), $(args[2]))")
     t_in = IR.type(a)
     # Determine the input element bit width.
-    elem_t = IR.isvector(t_in) ? IR.eltype(t_in) : t_in
+    elem_t = IR.isvector(t_in) ? eltype(t_in) : t_in
     elem_bits = if elem_t == IR.Type(Int32)
         32
     elseif elem_t == IR.Type(Int64)
@@ -1595,7 +1626,7 @@ function emit_cat!(lc::LowerCtx, args, @nospecialize(typ))
     # `size(lhs, mlir_axis)`.
     lhs_t = IR.type(lhs)
     rhs_t = IR.type(rhs)
-    elem_t = IR.eltype(out_t)
+    elem_t = eltype(out_t)
     # Start with a zero-splat result and use two insert_strided_slice ops.
     out_shape = [Int(size(out_t, i)) for i in 1:out_rank]
     zero_attr = _splat_attr(zero(tile_eltype(typ)), out_t)
@@ -1604,7 +1635,7 @@ function emit_cat!(lc::LowerCtx, args, @nospecialize(typ))
     lhs_offsets = Int64[i == mlir_axis ? 0 : 0 for i in 0:(out_rank - 1)]
     lhs_strides = Int64[1 for _ in 0:(ndims(lhs_t) - 1)]
     base1 = IR.result(_vector.insert_strided_slice(lhs, base;
-        result=out_t,
+        res=out_t,
         offsets=_i64_array_attr(lhs_offsets),
         strides=_i64_array_attr(lhs_strides)))
 
@@ -1612,7 +1643,7 @@ function emit_cat!(lc::LowerCtx, args, @nospecialize(typ))
                         for i in 0:(out_rank - 1)]
     rhs_strides = Int64[1 for _ in 0:(ndims(rhs_t) - 1)]
     return IR.result(_vector.insert_strided_slice(rhs, base1;
-        result=out_t,
+        res=out_t,
         offsets=_i64_array_attr(rhs_offsets),
         strides=_i64_array_attr(rhs_strides)))
 end
@@ -2159,10 +2190,14 @@ function emit_reduce!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
     # Kind attribute
     kind_name = reduction_kind_name(combiner, eT)
     kind_attr = parse(IR.Attribute, "#vector.kind<$kind_name>")
-    # reduction_dims must be a `DenseI64ArrayAttr` (`array<i64: ...>`), not
-    # a generic ArrayAttr — multi_reduction's verifier specifically requests
-    # the dense array form.
-    rd_attr = IR.DenseArrayAttribute(Int64[mlir_dim])
+    # `reduction_dims` is typed as `I64ArrayAttr` (regular `[N : i64]`) in
+    # MLIR 18 and `DenseI64ArrayAttr` (`array<i64: N>`) in MLIR 19+ — pick the
+    # right form from the active MLIR version. (Detected via `MLIR.MLIR_VERSION[]`.)
+    rd_attr = if MLIR.MLIR_VERSION[] < v"19"
+        parse(IR.Attribute, "[$(mlir_dim) : i64]")
+    else
+        parse(IR.Attribute, "array<i64: $(mlir_dim)>")
+    end
 
     # Output type after multi_reduction = vector or scalar.
     out_t = if isempty(out_mr_shape)
@@ -2464,13 +2499,10 @@ function emit_iota!(lc::LowerCtx, args, @nospecialize(typ))
     length(shape) == 1 ||
         error("iota: only 1-D iota is supported, got shape $shape")
     N = Int(shape[1])
-    idx_vec_t = IR.VectorType(1, Int[N], IR.IndexType())
-    step_v = IR.result(_vector.step(; result=idx_vec_t))
+    # `vector.step` is MLIR 19+. Emit a constant `[0, 1, ..., N-1]` directly
+    # in the iota dtype — same result, one fewer op.
     out_t = mlir_tile_type(shape, T)
-    if out_t == idx_vec_t
-        return step_v
-    end
-    return IR.result(_arith.index_cast(step_v; out=out_t))
+    return _emit_step_vec(out_t, T, N)
 end
 
 # cuTile Intrinsics.bitcast(src, target_T) — a signless reinterpret. For tile
@@ -2654,15 +2686,29 @@ end
 # default. Cross-thread synchronisation beyond what libomp + acq_rel give
 # isn't part of this target.
 
-# `<kind>` keyword → integer enum code for `memref.atomic_rmw`'s `kind`
-# attribute (i64). Discovered empirically by parsing each textual form and
-# reading back `getattr(op, "kind")`.
-const _ATOMIC_RMW_KIND_CODES = Dict{Symbol, Int}(
+# `memref.atomic_rmw`'s `kind` attribute is an integer-encoded enum, BUT
+# the enum was reordered between MLIR 18 and MLIR 20 (and `xori` removed in
+# MLIR 20). Codes verified by parsing each kind keyword and reading back
+# the attribute's int value. Version-conditional table chosen at MLIR call
+# time via `MLIR.MLIR_VERSION[]`.
+const _ATOMIC_RMW_KIND_CODES_V18 = Dict{Symbol, Int}(
     :addf => 0, :addi => 1, :andi => 2, :assign => 3,
     :maximumf => 4, :maxnumf => 5, :maxs => 6, :maxu => 7,
     :minimumf => 8, :minnumf => 9, :mins => 10, :minu => 11,
     :mulf => 12, :muli => 13, :ori => 14, :xori => 15,
 )
+const _ATOMIC_RMW_KIND_CODES_V20 = Dict{Symbol, Int}(
+    :addf => 0, :addi => 1, :assign => 2,
+    :maximumf => 3, :maxs => 4, :maxu => 5,
+    :minimumf => 6, :mins => 7, :minu => 8,
+    :mulf => 9, :muli => 10, :ori => 11, :andi => 12,
+    :maxnumf => 13, :minnumf => 14,
+    # NOTE: no :xori in MLIR 20 — emit_atomic_rmw_generic! handles that case.
+)
+function _atomic_rmw_kind_codes()
+    return MLIR.MLIR_VERSION[] < v"19" ? _ATOMIC_RMW_KIND_CODES_V18 :
+                                         _ATOMIC_RMW_KIND_CODES_V20
+end
 
 # Pick the `memref.atomic_rmw` kind keyword for a given cuTile op symbol
 # (`:add` / `:max` / `:min` / `:and` / `:or` / `:xor` / `:xchg`) at a given
@@ -2700,8 +2746,10 @@ end
 
 # Materialise an MLIR `kind` attribute for `memref.atomic_rmw`.
 function _atomic_rmw_kind_attr(kind_kw::Symbol)
-    code = get(_ATOMIC_RMW_KIND_CODES, kind_kw, nothing)
-    code === nothing && error("atomic_rmw: unknown kind $kind_kw")
+    codes = _atomic_rmw_kind_codes()
+    code = get(codes, kind_kw, nothing)
+    code === nothing && error("atomic_rmw: kind $kind_kw not available in MLIR " *
+                              "$(MLIR.MLIR_VERSION[])")
     return IR.Attribute(code, IR.Type(Int64))
 end
 
@@ -2749,7 +2797,7 @@ function emit_atomic_rmw!(lc::LowerCtx, args, @nospecialize(typ), op::Symbol)
 
     n_lanes = prod(off.idx_shape)
     elem_mlir = mlir_elem_type(elem_T)
-    idx_elem_t = IR.eltype(IR.type(off.indices))
+    idx_elem_t = eltype(IR.type(off.indices))
 
     last_old = nothing
     for lane in 0:(n_lanes - 1)
@@ -2863,7 +2911,7 @@ function emit_atomic_cas!(lc::LowerCtx, args, @nospecialize(typ))
 
     n_lanes = prod(off.idx_shape)
     elem_mlir = mlir_elem_type(elem_T)
-    idx_elem_t = IR.eltype(IR.type(off.indices))
+    idx_elem_t = eltype(IR.type(off.indices))
 
     last_old = nothing
     for lane in 0:(n_lanes - 1)
@@ -2956,7 +3004,7 @@ function emit_atomic_rmw_generic!(lc::LowerCtx, args, @nospecialize(typ),
 
     n_lanes = prod(off.idx_shape)
     elem_mlir = mlir_elem_type(elem_T)
-    idx_elem_t = IR.eltype(IR.type(off.indices))
+    idx_elem_t = eltype(IR.type(off.indices))
 
     last_old = nothing
     for lane in 0:(n_lanes - 1)
@@ -3122,7 +3170,7 @@ function emit_spmd_memoryrefnew!(lc::LowerCtx, idx::Int, args, @nospecialize(typ
     # for downstream `memref` ops by subtracting 1 splat'd into the vector.
     t = IR.type(idx_v)
     if IR.isvector(t)
-        elem_t = IR.eltype(t)
+        elem_t = eltype(t)
         n = Int(size(t, 1))
         one_attr = _splat_attr(_one_of_elem(elem_t), t)
         one_v = IR.result(_arith.constant(; value=one_attr, result=t))

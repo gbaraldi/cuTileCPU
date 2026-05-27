@@ -114,13 +114,8 @@ function cpu_function(@nospecialize(f), argtypes::Type;
         lower_to_mlir(sci, argtypes; kernel_name, n_grid_dims,
                       divby_info, bounds_info)
 
-    mlir_text = String("")
-    @with_context mlir_ctx begin
-        mlir_text = sprint(show, mod)
-    end
-
     passes = serial ? SERIAL_PASSES : DEFAULT_PASSES
-    so_path = compile_to_so(mlir_text; kernel_name, passes)
+    so_path = compile_module_to_so(mod, mlir_ctx; kernel_name, passes)
     h = Libdl.dlopen(so_path)
     fn = Libdl.dlsym(h, Symbol("_mlir_ciface_" * kernel_name))
 
@@ -476,13 +471,8 @@ function spmd_function(@nospecialize(f), argtypes::Type;
     mod, param_julia_types, mlir_ctx, param_kinds =
         lower_to_mlir_spmd(sci, argtypes; kernel_name, lane_width, alignment)
 
-    mlir_text = String("")
-    @with_context mlir_ctx begin
-        mlir_text = sprint(show, mod)
-    end
-
     passes = serial ? SERIAL_PASSES : DEFAULT_PASSES
-    so_path = compile_to_so(mlir_text; kernel_name, passes)
+    so_path = compile_module_to_so(mod, mlir_ctx; kernel_name, passes)
     h = Libdl.dlopen(so_path)
     fn = Libdl.dlsym(h, Symbol("_mlir_ciface_" * kernel_name))
 
