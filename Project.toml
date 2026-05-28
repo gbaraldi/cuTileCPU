@@ -16,12 +16,14 @@ cuTile = "0dea8319-8c4a-4662-a73d-20234d115b9a"
 MLIR = {path = "/home/gbaraldi/.julia/dev/MLIR"}
 
 [weakdeps]
+Atomix = "a9b6321e-bd34-4604-b9c9-b65b8de01458"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 
 [extensions]
-KernelAbstractionsExt = "KernelAbstractions"
+KernelAbstractionsExt = ["KernelAbstractions", "Atomix"]
 
 [compat]
+Atomix = "0.1, 1"
 IRStructurizer = "0.6.2"
 KernelAbstractions = "0.9"
 LLVM_full_jll = "21.1.8"

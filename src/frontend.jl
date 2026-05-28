@@ -65,6 +65,25 @@ module Intrinsics
 
     # Workgroup barrier (CPU: no-op; GPU: gpu.barrier). Returns nothing.
     @noinline barrier() = compilerbarrier(:type, nothing)
+
+    # Atomic read-modify-write at a 1-based linear index. The KA extension
+    # overlays `Atomix.modify!(IndexableRef, op, x, ord)` — i.e. `KA.@atomic` /
+    # `Atomix.@atomic`, KA's *portable* atomic — onto this marker, stopping the
+    # default-opt inline cascade before it degrades to raw pointer arithmetic +
+    # an `atomicrmw` llvmcall. The walker routes it to the `memref.atomic_rmw`
+    # emitter. `op` is the reduction function (+/max/min/&/|), `idx` the 1-based
+    # linear index.
+    #
+    # The `Base.donotdelete` is essential: the marker's result is discarded (the
+    # atomic is used for its memory side effect, not its value), and
+    # `compilerbarrier` is itself effect-free + nothrow, so without an effect the
+    # marker is inferred effect-free and DCE deletes the whole call before the
+    # walker ever sees it — the atomic silently vanishes. `donotdelete` makes the
+    # method `!effect_free`, so the call is preserved for the walker to rewrite.
+    @noinline function atomic_index!(arr, op, val, idx)
+        Base.donotdelete(arr, val, idx)
+        return compilerbarrier(:type, val)
+    end
 end
 
 # Predicate mirroring cuTile's `isintrinsic`: a function defined in our

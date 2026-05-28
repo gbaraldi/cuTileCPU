@@ -1760,6 +1760,33 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
             return emit_spmd_memoryrefget!(lc, args, typ)
         elseif fname === :memoryrefset!
             return emit_spmd_memoryrefset!(lc, args, typ)
+        elseif fname === :atomic_index!
+            # KA.@atomic / Atomix.@atomic — KA's *portable* atomic. The KA
+            # extension overlays `Atomix.modify!(IndexableRef, op, x, ord)` onto
+            # `Frontend.Intrinsics.atomic_index!(arr, op, val, idx)`, so by the
+            # time the walker sees it the call is a clean marker (not the raw
+            # pointer-arithmetic + `atomicrmw` llvmcall it would otherwise inline
+            # to). Adapt to the modifyindex emitter, which expects
+            # (mem, order, op, val, idx): `arr` (an Argument) is accepted
+            # directly as `mem` and `order` is unused, so we pad position 2.
+            return emit_spmd_atomic_modifyindex!(lc,
+                (args[1], args[1], args[2], args[3], args[4]), typ)
+        elseif fname === :modifyindex_atomic!
+            # Bare `Base.@atomic arr[i] op= x` (CPU array) → Base.modifyindex_atomic!.
+            # Not the KA-portable form (that's `KA.@atomic`/`:atomic_index!`
+            # above) but Julia-native array atomics work on this path too.
+            return emit_spmd_atomic_modifyindex!(lc, args, typ)
+        elseif fname === :throw_methoderror && length(args) >= 1 &&
+               callee_name(args[1]) === :modifyindex_atomic!
+            # In a KA kernel, `@atomic arr[bucket] += x` lowers to
+            # `Base.modifyindex_atomic!(arr, order, op, val, i)` — but that
+            # method wants a GenericMemory first arg, not the Vector, so under
+            # the Frontend interpreter inference can't resolve it and wraps the
+            # intended call as `Core.throw_methoderror(modifyindex_atomic!, arr,
+            # order, op, val, i)` (kernel rettype becomes Union{}). The atomic
+            # is fully recoverable from args[2:end]; we emit it directly and
+            # the bogus "throw" never happens (we replace it with the RMW).
+            return emit_spmd_atomic_modifyindex!(lc, args[2:end], typ)
         elseif fname === :throw || fname === :throw_complex_domainerror ||
                fname === :throw_inexacterror || fname === :throw_overflowerror
             # Dead inside elided bounds-check IfOps; if we hit it here the
@@ -1979,6 +2006,16 @@ function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecializ
         v = resolve_value_or_const(lc, args[2])
         v === nothing && error("$name: unresolved operand $(args[2])")
         out_t = _conv_out_type(v, target_T)
+        # Same-width int conversions are no-ops, and `arith.{extsi,extui,trunci}`
+        # reject equal operand/result types. This fires on the SPMD lane index:
+        # `global_index()` is typed `Int32` in Julia, but the lane vector is
+        # materialised directly at `lane_idx_type` (Int64) width, so a later
+        # `Core.sext_int(Int64, i)` would emit an illegal `extsi i64→i64`. Pass
+        # the operand through unchanged.
+        if (name === :sext_int || name === :zext_int || name === :trunc_int) &&
+           IR.type(v) == out_t
+            return v
+        end
         name === :sext_int  && return IR.result(_arith.extsi(v; out=out_t))
         name === :zext_int  && return IR.result(_arith.extui(v; out=out_t))
         name === :trunc_int && return IR.result(_arith.trunci(v; out=out_t))
@@ -2937,6 +2974,18 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
         end
         error("getfield: cannot resolve SSA-rooted obj %$(obj.id) at field $ki")
     end
+    # Constant-tuple obj: `getfield((c1, c2, …), k)` with a const index. Arises
+    # from a literal-index `KA.@atomic out[1] op x` — the IndexableRef's index
+    # tuple `(1,)` is a compile-time constant the Frontend interpreter (default
+    # opt params) doesn't fold through `ref.indices[1]`, so it reaches the walker
+    # as a getfield on the literal tuple. Extract and materialise the element.
+    if obj isa Tuple
+        k = something(resolve_const(lc, args[2]), args[2])
+        k isa Integer || error("getfield(tuple): index must be const int, got $(args[2])")
+        v = resolve_value_or_const(lc, obj[Int(k)])
+        v === nothing && error("getfield(tuple): element $(obj[Int(k)]) not resolvable")
+        return v
+    end
     error("getfield: unsupported obj $obj")
 end
 
@@ -3421,6 +3470,23 @@ function _atomic_rmw_kind(op::Symbol, elem_T::Type)
     error("atomic_rmw: unsupported op $op")
 end
 
+# `#vector.kind<…>` keyword for a `vector.reduction` that collapses the W SPMD
+# lanes of one block with the atomic's reduction op (`:add`/`:max`/`:min`/`:and`/
+# `:or`). Used when many lanes target the *same* slot: the lanes are SIMD lanes
+# of one block (no intra-block race), so we reduce them in-register first and do
+# a single atomic per block instead of W atomics. Note the float-add reduction
+# uses the `add` kind (which is `fadd` on float operands).
+function _atomic_reduce_kind(op::Symbol, elem_T::Type)
+    is_float = elem_T <: AbstractFloat
+    is_signed = elem_T <: Signed || elem_T === Bool || !(elem_T <: Unsigned)
+    op === :add && return :add
+    op === :max && return is_float ? :maxnumf : (is_signed ? :maxsi : :maxui)
+    op === :min && return is_float ? :minnumf : (is_signed ? :minsi : :minui)
+    op === :and && return :and
+    op === :or  && return :or
+    error("atomic reduce: unsupported op $op")
+end
+
 # Materialise an MLIR `kind` attribute for `memref.atomic_rmw`.
 function _atomic_rmw_kind_attr(kind_kw::Symbol)
     codes = _atomic_rmw_kind_codes()
@@ -3436,6 +3502,21 @@ end
 function _emit_one_atomic_rmw!(base_memref::IR.Value, idx_v::IR.Value,
                                 val_v::IR.Value, kind_kw::Symbol,
                                 elem_T::Type)
+    # NOTE float min/max: `memref.atomic_rmw maxnumf`/`minnumf` is the correct
+    # high-level form (it should lower to `llvm.atomicrmw fmax`/`fmin`), but
+    # MLIR ≤ 20's `finalize-memref-to-llvm` does NOT lower these kinds — the op
+    # survives with dangling `unrealized_conversion_cast` operands and LLVM
+    # translation returns null. (`addf/addi` and integer `maxs/mins/maxu/minu`
+    # all lower fine.) Routing through `generic_atomic_rmw` doesn't help either:
+    # MLIR lowers that to `llvm.cmpxchg`, which rejects float operands (it needs
+    # a bitcast-to-int CAS loop we can't express without dropping to the LLVM
+    # dialect by hand). The fix is MLIR ≥ 21, where the native lowering exists.
+    # We keep emitting the high-level op and surface a clear error on old MLIR.
+    if (kind_kw === :maxnumf || kind_kw === :minnumf) && MLIR.MLIR_VERSION[] < v"21"
+        error("atomic_rmw $kind_kw (float min/max) is not lowered by MLIR " *
+              "$(MLIR.MLIR_VERSION[])'s memref→llvm pass; requires MLIR ≥ 21. " *
+              "Use an integer element type, atomic add, or a newer MLIR_jll.")
+    end
     elem_mlir = mlir_elem_type(elem_T)
     kind_attr = _atomic_rmw_kind_attr(kind_kw)
     idx_index = cast_to_index(idx_v)
@@ -3822,6 +3903,107 @@ function _spmd_lane_base(lc::LowerCtx)
     W_const = IR.result(_arith.constant(;
         value=IR.Attribute(Int(lc.lane_width), idx_t)))
     return IR.result(_arith.muli(bid, W_const; result=idx_t))
+end
+
+# `Base.modifyindex_atomic!(mem, order, op, val, i)` — the CPU-array target of
+# KA `@atomic arr[i] op= x`. On the SPMD path the index `i` is the per-lane
+# bucket (a lane vector, e.g. `idx[lane]`), so this is a SCATTER of W atomic
+# RMWs — one per lane into arr[bucket_lane] — mirroring the cuTile N-D
+# `emit_atomic_rmw!` lane loop. (A uniform/scalar index does a single atomic.)
+# We recover the base memref from the array arg (Argument or getfield(arr,:ref),
+# tracked in lc.field_refs); the order/scope and the old-value return are
+# dropped (the RMW effect is all that's modelled).
+#
+# args = (mem, order::Symbol, op, val, i). `op` is Main.+/max/min/... mapped via
+# _atomic_rmw_kind. `i` is 1-based Julia → 0-based for the memref.
+function emit_spmd_atomic_modifyindex!(lc::LowerCtx, args, @nospecialize(typ))
+    length(args) >= 5 ||
+        error("modifyindex_atomic!: expected (mem, order, op, val, i), got $args")
+    mem_ref, _order, op_ref, val_ref, idx_ref = args[1], args[2], args[3], args[4], args[5]
+
+    # Base memref + element type from the array arg.
+    arg_id =
+        if mem_ref isa SSAValue && haskey(lc.field_refs, mem_ref.id)
+            (aid, fld) = lc.field_refs[mem_ref.id]
+            fld === :ref || error("modifyindex_atomic!: mem must be getfield(arr,:ref), got :$fld")
+            aid
+        elseif mem_ref isa Argument
+            mem_ref.n
+        else
+            error("modifyindex_atomic!: cannot trace mem operand $mem_ref to an array arg")
+        end
+    haskey(lc.arg_vals, arg_id) ||
+        error("modifyindex_atomic!: no bound memref for arg $arg_id")
+    base = lc.arg_vals[arg_id]
+    elem_T = lc.arg_elem_types[arg_id]
+
+    # Reduction op → memref.atomic_rmw kind keyword.
+    op_sym = callee_name(op_ref)
+    op_kw = op_sym === :+   ? :add :
+            op_sym === :max ? :max :
+            op_sym === :min ? :min :
+            op_sym === :&   ? :and :
+            op_sym === :|   ? :or  :
+            error("modifyindex_atomic!: unsupported reduction op $op_sym")
+    kind_kw = _atomic_rmw_kind(op_kw, elem_T)
+    elem_mlir = mlir_elem_type(elem_T)
+
+    val_v = resolve_value_or_const(lc, val_ref)
+    val_v === nothing && error("modifyindex_atomic!: cannot resolve val $val_ref")
+    idx_v = resolve_value_or_const(lc, idx_ref)
+    idx_v === nothing && error("modifyindex_atomic!: cannot resolve index $idx_ref")
+
+    it = IR.type(idx_v)
+    if IR.isvector(it)
+        # Per-lane scatter: extract each lane's bucket (1-based) → 0-based →
+        # atomic_rmw. `val` is a scalar literal shared by all lanes; if it's a
+        # vector, extract per lane too.
+        n = Int(size(it, 1))
+        idx_elem_t = eltype(it)
+        one_attr = _splat_attr(_one_of_elem(idx_elem_t), it)
+        one_v = IR.result(_arith.constant(; value=one_attr, result=it))
+        idx0 = IR.result(_arith.subi(idx_v, one_v; result=it))   # 0-based vector
+        val_is_vec = IR.isvector(IR.type(val_v))
+        for lane in 0:(n - 1)
+            pos = IR.DenseArrayAttribute(Int64[lane])
+            b = IR.result(_vector.extract(idx0, IR.Value[];
+                    result=idx_elem_t, static_position=pos))
+            v = val_is_vec ?
+                IR.result(_vector.extract(val_v, IR.Value[];
+                    result=elem_mlir, static_position=pos)) : val_v
+            _emit_one_atomic_rmw!(base, b, v, kind_kw, elem_T)
+        end
+        return nothing
+    else
+        # Uniform/scalar index. 1-based → 0-based.
+        one_v = IR.result(_arith.constant(; value=IR.Attribute(1, it), result=it))
+        idx0 = IR.result(_arith.subi(idx_v, one_v; result=it))
+        if lc.lane_width > 1
+            # Uniform slot: ALL W SPMD lanes run the statement, every one
+            # targeting this same slot. Each lane's contribution is a lane of a
+            # vector<W> — either already per-lane (`@atomic out[1] op x[i]`) or a
+            # uniform scalar broadcast across the W lanes (`@atomic out[1] += c`).
+            # Collapse with a single in-register `vector.reduction <op>` then do
+            # ONE atomic per block (the only race is *across* blocks).
+            #
+            # Crucially the scalar case must broadcast FIRST: a uniform `+= c`
+            # means each of the W lanes adds `c`, so the reduction must SUM to
+            # `W*c` — emitting a single `c` atomic (the obvious-looking shortcut)
+            # silently undercounts a thread-counter by a factor of W. For the
+            # idempotent ops (max/min/and/or) the broadcast+reduce yields `c`, so
+            # they're correct either way; doing it uniformly keeps one code path.
+            vt = IR.VectorType(1, Int[lc.lane_width], elem_mlir)
+            val_vec = IR.isvector(IR.type(val_v)) ? val_v :
+                      IR.result(_vector.broadcast(val_v; vector=vt))
+            rkind = _atomic_reduce_kind(op_kw, elem_T)
+            kind_attr_red = parse(IR.Attribute, "#vector.kind<$rkind>")
+            reduced = IR.result(_vector.reduction(val_vec;
+                        dest=elem_mlir, kind=kind_attr_red))
+            return _emit_one_atomic_rmw!(base, idx0, reduced, kind_kw, elem_T)
+        end
+        # GPU SIMT (lane_width==1): one lane per thread, one atomic per thread.
+        return _emit_one_atomic_rmw!(base, idx0, val_v, kind_kw, elem_T)
+    end
 end
 
 # `Base.memoryrefnew(ref_ssa, idx, bc)`

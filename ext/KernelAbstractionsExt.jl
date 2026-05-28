@@ -28,6 +28,12 @@ const NDI = KernelAbstractions.NDIteration
 using MLIRKernels
 const FE = MLIRKernels.Frontend
 
+# Atomix is KA's portable-atomic backend: `KA.@atomic` / `Atomix.@atomic` both
+# expand to `Atomix.modify!(referenceable(arr)[i], op, x, order)`. We overlay
+# `modify!` (below) onto a Frontend marker so it survives inference as a clean
+# atomic instead of inlining down to a raw `atomicrmw` llvmcall.
+using Atomix
+
 import Base.Experimental: @overlay
 
 # ----------------------------------------------------------------------------
@@ -73,6 +79,23 @@ struct MLIRBackend <: KA.GPU end
     error("MLIRBackend: @localmem / SharedMemory not yet implemented")
 @overlay FE.METHOD_TABLE KA.Scratchpad(ctx, ::Type, ::Val) =
     error("MLIRBackend: @private / Scratchpad not yet implemented")
+
+# `KA.@atomic` / `Atomix.@atomic arr[i] op= x` — KA's *portable* atomic, the
+# form KA docs recommend (CUDA/AMDGPU/oneAPI all override `Atomix.modify!` for
+# their device arrays). It expands to `Atomix.modify!(referenceable(arr)[i],
+# op, x, order)[2]`. Under the Frontend's default opt params this `modify!`
+# (not `@noinline`) would otherwise inline all the way down to raw pointer
+# arithmetic + a `UnsafeAtomics` `atomicrmw` llvmcall — opaque to the walker.
+# Overlaying it onto our `atomic_index!` marker stops that cascade with the
+# array, op, value and 1-based linear index still as clean SSA values; the
+# walker (`:atomic_index!`) emits `memref.atomic_rmw`. `modify!` returns the
+# `(old, new)` pair Atomix expects; both are bound to `x` since the result is
+# discarded by `@atomic … op= …` used as a statement.
+@overlay FE.METHOD_TABLE function Atomix.modify!(
+        ref::Atomix.Internal.IndexableRef, op::OP, x, ord) where {OP}
+    FE.Intrinsics.atomic_index!(ref.data, op, x, ref.indices[1])
+    return (x, x)
+end
 
 # ----------------------------------------------------------------------------
 # 3. KA backend protocol
@@ -126,7 +149,19 @@ end
 function _resolve_wgsize(obj::KA.Kernel{MLIRBackend}, workgroupsize)
     wg_T = KA.workgroupsize(obj)
     if wg_T <: NDI.StaticSize
-        return NDI.get(wg_T)
+        static = NDI.get(wg_T)
+        # The workgroup size is baked into the kernel type. Honour an explicit
+        # launch-time kwarg only if it AGREES — otherwise it would be silently
+        # ignored (the kernel was already specialised for `static`), so error
+        # rather than run a size the user didn't ask for.
+        if workgroupsize !== nothing
+            wg = workgroupsize isa Integer ? (workgroupsize,) : Tuple(workgroupsize)
+            wg == static || error(
+                "MLIRBackend: workgroupsize=$wg conflicts with the kernel's " *
+                "static workgroupsize $static (baked in at `@kernel`-construction " *
+                "time). Drop the kwarg or rebuild the kernel with the new size.")
+        end
+        return static
     end
     workgroupsize === nothing && return (16,)
     workgroupsize isa Integer && return (workgroupsize,)
@@ -137,6 +172,20 @@ function (obj::KA.Kernel{MLIRBackend})(args...; ndrange=nothing,
                                                   workgroupsize=nothing)
     wg = _resolve_wgsize(obj, workgroupsize)
     nd = ndrange isa Integer ? (ndrange,) : ndrange
+
+    # The lowering is strictly 1-D: a single `scf.parallel` grid dimension and a
+    # contiguous lane vector `bid*W .. bid*W+W-1`. A multi-dimensional ndrange
+    # or workgroupsize would be silently collapsed (`W=first(wg)`,
+    # `total=prod(nd)`), corrupting @index(Local/Group, Linear) and @groupsize
+    # while leaving @index(Global, Linear) correct — i.e. a silent wrong answer
+    # in any kernel that uses the group/local indices. Reject it explicitly.
+    length(wg) == 1 || error(
+        "MLIRBackend: multi-dimensional workgroupsize=$wg not supported " *
+        "(the backend lowers a 1-D workgroup); use a scalar/1-tuple size.")
+    (nd === nothing || length(nd) == 1) || error(
+        "MLIRBackend: multi-dimensional ndrange=$nd not supported " *
+        "(the backend lowers a 1-D grid); flatten to a 1-D ndrange.")
+
     _, _, iterspace, _ = KA.launch_config(obj, nd, wg)
 
     ctx = KA.mkcontext(obj, nd, iterspace)

@@ -536,7 +536,13 @@ function ka_function(@nospecialize(f), argtypes::Type;
     # Standalone inference via Frontend (KA overlays live in
     # Frontend.METHOD_TABLE — see ext/KernelAbstractionsExt.jl). No cuTile.
     sci, rettype = Frontend.structured(f, argtypes)
-    rettype === Nothing ||
+    # `Union{}` is allowed: a KA kernel whose only effect is an `@atomic`
+    # infers as `Union{}` because `Base.modifyindex_atomic!` doesn't resolve
+    # for a Vector arg (it wants GenericMemory) → inference models the call as
+    # `Core.throw_methoderror`. The walker intercepts that and emits a real
+    # `memref.atomic_rmw`, so the kernel does return normally. See
+    # `emit_spmd_atomic_modifyindex!` in lower.jl.
+    (rettype === Nothing || rettype === Union{}) ||
         error("ka_function: kernel must return Nothing, got $rettype")
 
     mod, param_julia_types, mlir_ctx, param_kinds =
