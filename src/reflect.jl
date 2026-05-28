@@ -16,11 +16,14 @@ tuple of runtime values (in which case `cuTileconvert` is applied).
 function code_mlir(@nospecialize(f), argtypes::Type;
                    kernel_name::String=string(nameof(f)), n_grid_dims::Int=1,
                    spmd::Bool=false, lane_width::Int=16, alignment::Int=16)
-    sci, rettype, divby_info, bounds_info = _structured_with_analyses(f, argtypes)
     if spmd
+        # SPMD reflection uses the standalone Frontend (no cuTile inference),
+        # matching the spmd_function launch path.
+        sci, rettype = Frontend.structured(f, argtypes)
         mod, _, mlir_ctx, _ = lower_to_mlir_spmd(sci, argtypes;
                                                   kernel_name, lane_width, alignment)
     else
+        sci, rettype, divby_info, bounds_info = _structured_with_analyses(f, argtypes)
         mod, _, mlir_ctx, _ = lower_to_mlir(sci, argtypes; kernel_name, n_grid_dims,
                                             divby_info, bounds_info)
     end

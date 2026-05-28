@@ -112,6 +112,7 @@ function fresh_context()
 end
 
 include("allocator.jl")
+include("frontend.jl")
 include("lower.jl")
 include("compile.jl")
 include("launch.jl")

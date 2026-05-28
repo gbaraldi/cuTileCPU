@@ -88,7 +88,7 @@ function compile_ka_to_cufunction(gpu_body, N, W; kernel_name="vadd_ka")
     # quirks.
     AT = Tuple{ctxT, Vector{Float32}, Vector{Float32}, Vector{Float32}}
 
-    sci, rettype, _, _ = cuTileCPU._structured_with_analyses(gpu_body, AT)
+    sci, rettype = cuTileCPU.Frontend.structured(gpu_body, AT)
     rettype === Nothing || @warn "KA gpu body inferred rettype = $rettype (expected Nothing)"
     # ctx is arg-slot 2 (slot 1 is the function itself).
     mod, _, mlir_ctx, kinds =

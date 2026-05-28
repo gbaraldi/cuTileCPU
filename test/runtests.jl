@@ -2123,4 +2123,53 @@ end
         end
     end
 
+    # KernelAbstractions CPU backend (cuTileBackend <: KA.GPU). Guarded on KA
+    # being loadable: the package's own test env (--project=.) has KA only as
+    # a weakdep, so this skips there and runs whenever KA is present (e.g. an
+    # env that adds it). Validates the fully cuTile-decoupled KA path: KA
+    # @kernel → Frontend.structured (own interpreter/intrinsics) → MLIR → clang.
+    @testset "KA: vadd via cuTileBackend (CPU, decoupled)" begin
+        ka_loaded = try
+            @eval using KernelAbstractions
+            true
+        catch
+            false
+        end
+        if !ka_loaded
+            @info "KernelAbstractions not in this env — skipping KA backend test"
+            @test true  # placeholder so the testset is non-empty
+        else
+            KA = KernelAbstractions
+            KAExt = Base.get_extension(cuTileCPU, :KernelAbstractionsExt)
+            Backend = KAExt.cuTileBackend
+            @eval begin
+                @kernel function _ka_vadd!(C, A, B)
+                    i = @index(Global, Linear)
+                    @inbounds C[i] = A[i] + B[i]
+                end
+            end
+            N = 4096; W = 16
+            A = cuTileCPU.aligned_array(Float32, N; alignment=128); copyto!(A, rand(Float32, N))
+            B = cuTileCPU.aligned_array(Float32, N; alignment=128); copyto!(B, rand(Float32, N))
+            C = cuTileCPU.aligned_array(Float32, N; alignment=128); fill!(C, 0f0)
+            (@eval _ka_vadd!)(Backend(), W)(C, A, B; ndrange=N)
+            @test C ≈ A .+ B
+            # The @noinline global_index marker must survive inference under
+            # the Frontend interpreter (default opt params) — i.e. appear as a
+            # call in the SCI, not be inlined/folded away.
+            gpu_body = @eval gpu__ka_vadd!
+            ctxT = let
+                ndr = KA.NDIteration.StaticSize{(N,)}
+                wg  = KA.NDIteration.StaticSize{(W,)}
+                grp = KA.NDIteration.StaticSize{(N ÷ W,)}
+                ndro = KA.NDIteration.NDRange{1, grp, wg, Nothing, Nothing}
+                KA.CompilerMetadata{ndr, KA.NDIteration.NoDynamicCheck, Nothing, Nothing, ndro}
+            end
+            sci, rt = cuTileCPU.Frontend.structured(gpu_body,
+                Tuple{ctxT, Vector{Float32}, Vector{Float32}, Vector{Float32}})
+            @test rt === Nothing
+            @test occursin("global_index", sprint(show, sci))
+        end
+    end
+
 end

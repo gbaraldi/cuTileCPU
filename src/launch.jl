@@ -469,7 +469,10 @@ function spmd_function(@nospecialize(f), argtypes::Type;
     key = (f, argtypes, 1, serial, lane_width, alignment)
     haskey(_spmd_kernel_cache, key) && return _spmd_kernel_cache[key]::CPUKernel
 
-    sci, rettype, _, _ = _structured_with_analyses(f, argtypes)
+    # Standalone inference — no cuTile interpreter. Plain-Julia SPMD kernels
+    # use no cuTile tile intrinsics, so Frontend.structured (own interpreter,
+    # own Intrinsics, default opt params) is all that's needed.
+    sci, rettype = Frontend.structured(f, argtypes)
     rettype === Nothing ||
         error("spmd_function: kernel must return Nothing, got $rettype")
 
@@ -530,7 +533,9 @@ function ka_function(@nospecialize(f), argtypes::Type;
     key = (f, argtypes, 1, serial, lane_width, alignment)
     haskey(_ka_kernel_cache, key) && return _ka_kernel_cache[key]::CPUKernel
 
-    sci, rettype, _, _ = _structured_with_analyses(f, argtypes)
+    # Standalone inference via Frontend (KA overlays live in
+    # Frontend.METHOD_TABLE — see ext/KernelAbstractionsExt.jl). No cuTile.
+    sci, rettype = Frontend.structured(f, argtypes)
     rettype === Nothing ||
         error("ka_function: kernel must return Nothing, got $rettype")
 

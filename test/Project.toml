@@ -1,5 +1,5 @@
 [deps]
-Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 cuTile = "0dea8319-8c4a-4662-a73d-20234d115b9a"

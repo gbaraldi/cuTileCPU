@@ -5,23 +5,28 @@ module KernelAbstractionsExt
 #   1. `struct cuTileBackend <: KA.GPU` so KA's `@kernel` macro picks the
 #      `gpu_*` (SIMT) function body, not the `cpu_*` (loop-splitting) one.
 #
-#   2. `@overlay cuTile.cuTileMethodTable` redefinitions of the KA intrinsics
-#      consulted by inference inside `ct.emit_julia`. The overlay bodies
-#      replace KA calls with expressions our walker already handles —
-#      principally the sentinel `__cutilecpu_spmd_lane_id()` which a single
-#      walker clause maps to the SPMD lane vector.
+#   2. `@overlay cuTileCPU.Frontend.METHOD_TABLE` redefinitions of the KA
+#      intrinsics. Inference runs under cuTileCPU's *own* Frontend
+#      interpreter (src/frontend.jl) — NOT cuTile's — so the overlays map KA
+#      intrinsics onto cuTileCPU's own `Frontend.Intrinsics` markers, which
+#      the walker recognises by name. No cuTile dependency.
 #
 #   3. `(::Kernel{cuTileBackend})(args...; ndrange, workgroupsize)` builds the
 #      KA `CompilerMetadata` type and calls `ka_function` → `lower_to_mlir_ka`
 #      → in-process MLIR pipeline → clang → dlopen, then dispatches the grid
 #      via the standard SPMD-style launch path.
+#
+# This extension no longer depends on cuTile in any way: the Frontend owns
+# its interpreter, its Intrinsics module, and its overlay method table, so
+# the intrinsic markers are defined at the package's own precompile and the
+# overlays are ordinary precompile-safe method additions — no `__init__`
+# cross-module eval.
 
 using KernelAbstractions
 const KA = KernelAbstractions
 const NDI = KernelAbstractions.NDIteration
-using cuTile
-const ct = cuTile
 using cuTileCPU
+const FE = cuTileCPU.Frontend
 
 import Base.Experimental: @overlay
 
@@ -32,64 +37,31 @@ import Base.Experimental: @overlay
 struct cuTileBackend <: KA.GPU end
 
 # ----------------------------------------------------------------------------
-# 2. Overlays into cuTile's method table
+# 2. Overlays into the Frontend method table
 # ----------------------------------------------------------------------------
 #
-# Sentinel intrinsic. The cuTileCPU walker recognises calls to this (by
-# name) in SPMD/KA mode and binds them to the lane value — the lane vector
-# on the CPU path, or the scalar global thread index on the GPU path (see
-# the `:__cutilecpu_spmd_lane_id` clause in `src/lower.jl`).
-#
-# It must be defined INSIDE `cuTile.Intrinsics`, with an opaque
-# `compilerbarrier(:type, nothing)` body + a `cuTile.tfunc` return-type
-# override — i.e. exactly what cuTile's `@intrinsic` macro generates. The
-# `Intrinsics`-module membership is load-bearing: cuTile's interpreter
-# only marks calls as `CC.NoCallInfo()` (keeping them as `Expr(:call)`,
-# un-inlined) when `parentmodule(f) === Intrinsics` (see `isintrinsic` in
-# cuTile/src/compiler/interpreter.jl). A function of the same shape defined
-# anywhere else gets normal call info and is inlined away — its body
-# leaks into the structured IR and the walker never sees a call to
-# intercept.
-#
-# Creating a *new binding* inside `cuTile.Intrinsics` via `eval` is illegal
-# during the extension's PRECOMPILE (Julia forbids mutating another
-# module's bindings then). So we do it at runtime in `__init__`, where
-# cross-module eval is allowed. (A cleaner long-term fix is to vendor
-# cuTile's interpreter/intrinsic machinery into a shared layer so cuTileCPU
-# owns intrinsic definition — design-doc step 4.) The `__index_Global_Linear`
-# overlay references the intrinsic, so it too is installed in `__init__`.
-function __init__()
-    Core.eval(cuTile.Intrinsics, quote
-        @noinline __cutilecpu_spmd_lane_id() = $(Base.compilerbarrier)(:type, nothing)
-    end)
-    @eval begin
-        const __cutilecpu_spmd_lane_id = cuTile.Intrinsics.__cutilecpu_spmd_lane_id
-        # Return-type override consulted by cuTileInterpreter (`tfunc(𝕃,f,…)`).
-        cuTile.tfunc(𝕃, ::typeof(cuTile.Intrinsics.__cutilecpu_spmd_lane_id)) = Int32
-        # `__index_Global_Linear(ctx)` → the global linear thread index.
-        @overlay ct.cuTileMethodTable KA.__index_Global_Linear(ctx) =
-            cuTile.Intrinsics.__cutilecpu_spmd_lane_id()
-    end
-    return
-end
+# Each maps a KA intrinsic onto a `Frontend.Intrinsics` marker (a @noinline +
+# compilerbarrier function that survives inference under the Frontend's
+# default-opt-params interpreter) which the walker intercepts. All are plain
+# method additions to OUR table — precompile-safe.
+
+# `__index_Global_Linear(ctx)` → global linear thread index (1-based).
+@overlay FE.METHOD_TABLE KA.__index_Global_Linear(ctx) = FE.Intrinsics.global_index()
 
 # `__validindex(ctx)` — for launches where ndrange is a multiple of the
-# workgroup size, every lane is valid. Tighter (lane < ndrange) handling is
-# a TODO; the kernel would need to thread `ndrange` through as a uniform
-# scalar arg and we'd emit a vector compare + `vector.gather`/`scatter` with
-# a per-lane mask. (No intrinsic reference → safe at precompile.)
-@overlay ct.cuTileMethodTable KA.__validindex(ctx) = true
+# workgroup size, every lane is valid. Tighter (lane < ndrange) masking is a
+# TODO (thread `ndrange` through and emit a per-lane mask compare).
+@overlay FE.METHOD_TABLE KA.__validindex(ctx) = true
 
-# `__synchronize()` — CPU SIMD has no warp barrier. For kernels without
-# cross-lane communication this is a no-op. Kernels that depend on a real
-# barrier (after `@localmem` + reduction patterns) need a different lowering
-# strategy that this POC doesn't yet handle.
-@overlay ct.cuTileMethodTable KA.__synchronize() = nothing
+# `__synchronize()` → workgroup barrier marker. CPU SIMD has no warp barrier
+# so the walker lowers `:barrier` to a no-op; on the GPU SIMT path with no
+# cross-lane communication this is correct for the current scope.
+@overlay FE.METHOD_TABLE KA.__synchronize() = FE.Intrinsics.barrier()
 
-# `SharedMemory` / `Scratchpad` — not yet wired up.
-@overlay ct.cuTileMethodTable KA.SharedMemory(::Type{T}, ::Val, ::Val) where {T} =
+# `SharedMemory` / `Scratchpad` — not yet wired up (Phase B / B7,B8).
+@overlay FE.METHOD_TABLE KA.SharedMemory(::Type{T}, ::Val, ::Val) where {T} =
     error("cuTileBackend: @localmem / SharedMemory not yet implemented")
-@overlay ct.cuTileMethodTable KA.Scratchpad(ctx, ::Type, ::Val) =
+@overlay FE.METHOD_TABLE KA.Scratchpad(ctx, ::Type, ::Val) =
     error("cuTileBackend: @private / Scratchpad not yet implemented")
 
 # ----------------------------------------------------------------------------

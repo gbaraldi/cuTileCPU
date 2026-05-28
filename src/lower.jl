@@ -1762,15 +1762,31 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
         end
     end
 
-    # Sentinel function emitted by KernelAbstractions overlays (see
-    # `ext/KernelAbstractionsExt.jl`): `KA.__index_Global_Linear(ctx)` is
-    # overlaid to `__cutilecpu_spmd_lane_id()`, which inference inlines as
-    # a call to a function we never define. The walker recognises the call
-    # in SPMD/KA mode and returns the lane vector synthesized at the top of
-    # the scf.parallel body.
-    if (fname === :__cutilecpu_spmd_lane_id || fname === :__ka_lane_id) &&
+    # Raw Core.Intrinsics / builtins from the Frontend (non-cuTile) path —
+    # see `emit_raw_core_intrinsic!`. The cuTile tile path never produces
+    # these (its passes rewrite them to cuTile Intrinsics handled above), so
+    # this is dead on that path.
+    if fname in _RAW_CORE_INTRINSICS
+        return emit_raw_core_intrinsic!(lc, fname, args, typ)
+    end
+
+    # Lane-index sentinel. The Frontend's `Frontend.Intrinsics.global_index`
+    # (and the legacy KA-overlay sentinels) mark the global thread index;
+    # the walker binds it to the lane value synthesized per grid step — a
+    # `vector<W×iX>` on the CPU/SPMD path, or a scalar `gpu.thread_id +
+    # block_id*block_dim` on the GPU SIMT path.
+    if (fname === :global_index || fname === :__cutilecpu_spmd_lane_id ||
+        fname === :__ka_lane_id) &&
        lc.spmd && haskey(lc.arg_vals, lc.lane_arg)
         return lc.arg_vals[lc.lane_arg]
+    end
+
+    # Workgroup barrier marker (`Frontend.Intrinsics.barrier`, from KA
+    # `@synchronize`). CPU SIMD has no warp barrier → no-op. (GPU barrier is
+    # a future step; on the SIMT GPU path with `__validindex→true` and no
+    # cross-lane communication, the no-op is correct for the current scope.)
+    if fname === :barrier && lc.spmd
+        return nothing
     end
 
     error("cuTileCPU.walk_call!: unhandled callee $fname " *
@@ -1786,6 +1802,138 @@ function emit_binop_value!(lc::LowerCtx, args, op_fn)
         error("$(op_fn): unresolved operands ($(args[1]), $(args[2]))")
     a, b = _spmd_harmonise(lc, a, b)
     return IR.result(op_fn(a, b))
+end
+
+# ----------------------------------------------------------------------------
+# Raw Core.Intrinsics / builtins (the Frontend path)
+# ----------------------------------------------------------------------------
+#
+# The cuTile *tile* path runs cuTile's `canonicalize!` → `lower_intr_pass!`,
+# which rewrites raw `Core.Intrinsics.add_float` → cuTile `Intrinsics.addf`
+# etc. (see cuTile.jl/src/compiler/transform/canonicalize.jl INTRINSIC_RULES).
+# The standalone `Frontend.structured` path (src/frontend.jl) does NOT run
+# those rules — it hands the walker the *raw* Julia intrinsic names. So the
+# walker recognises both: the cuTile-rewritten names (above) and the raw
+# names here, routing both to the same `_arith`/`_math` emitters.
+#
+# Mirrors INTRINSIC_RULES, PLUS the integer width-conversions
+# (`sext_int`/`zext_int`/`trunc_int`) that cuTile's rules omit — those
+# surface in plain Julia from `Int32` index widening (`a[gid::Int32]`),
+# which cuTile kernels never trigger. All emitters are vector-aware so they
+# work on SPMD lane vectors.
+const _RAW_CORE_INTRINSICS = Set{Symbol}([
+    :add_float, :sub_float, :mul_float, :div_float, :neg_float,
+    :add_int, :sub_int, :mul_int, :neg_int,
+    :and_int, :or_int, :xor_int, :not_int,
+    :slt_int, :sle_int, :ult_int, :ule_int, :eq_int, :ne_int,
+    :lt_float, :le_float, :eq_float, :ne_float,
+    :sext_int, :zext_int, :trunc_int, :bitcast,
+    :sitofp, :fptosi,
+    :ifelse, Symbol("==="),
+])
+
+# A constant matching `v`'s MLIR type (scalar or vector<N×elem>) holding the
+# given Julia value. Used for neg_int (0 - x) and not_int (x ^ all-ones).
+function _const_like(v::IR.Value, jval)
+    t = IR.type(v)
+    if IR.isvector(t)
+        return IR.result(_arith.constant(; value=_splat_attr(jval, t), result=t))
+    else
+        return IR.result(_arith.constant(; value=IR.Attribute(jval, t), result=t))
+    end
+end
+
+# Output MLIR type for a width conversion of `v` to element type `target_T`:
+# vector<N×target> if `v` is a vector, else scalar target.
+function _conv_out_type(v::IR.Value, target_T::Type)
+    t = IR.type(v)
+    et = mlir_elem_type(target_T)
+    return IR.isvector(t) ? IR.VectorType(1, Int[Int(size(t, 1))], et) : et
+end
+
+# All-ones Julia value of the element type behind MLIR type `t` (for not_int).
+function _allones_of_elem(t)
+    et = IR.isvector(t) ? eltype(t) : t
+    et == IR.Type(Int32)  && return Int32(-1)
+    et == IR.Type(Int64)  && return Int64(-1)
+    et == IR.Type(Bool)   && return true
+    et == IR.Type(UInt32) && return Int32(-1)
+    et == IR.Type(UInt64) && return Int64(-1)
+    return Int64(-1)
+end
+
+function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecialize(typ))
+    CP = ct.ComparisonPredicate
+    SG = ct.Signedness
+    # Float / int arithmetic — operand-inferred result, vector-harmonised.
+    name === :add_float && return emit_binop_value!(lc, args, _arith.addf)
+    name === :sub_float && return emit_binop_value!(lc, args, _arith.subf)
+    name === :mul_float && return emit_binop_value!(lc, args, _arith.mulf)
+    name === :div_float && return emit_binop_value!(lc, args, _arith.divf)
+    name === :add_int   && return emit_binop_value!(lc, args, _arith.addi)
+    name === :sub_int   && return emit_binop_value!(lc, args, _arith.subi)
+    name === :mul_int   && return emit_binop_value!(lc, args, _arith.muli)
+    name === :and_int   && return emit_binop_value!(lc, args, _arith.andi)
+    name === :or_int    && return emit_binop_value!(lc, args, _arith.ori)
+    name === :xor_int   && return emit_binop_value!(lc, args, _arith.xori)
+    if name === :neg_float
+        v = resolve_value_or_const(lc, args[1])
+        v === nothing && error("neg_float: unresolved operand")
+        return IR.result(_arith.negf(v))
+    elseif name === :neg_int
+        v = resolve_value_or_const(lc, args[1])
+        v === nothing && error("neg_int: unresolved operand")
+        return IR.result(_arith.subi(_const_like(v, 0), v))
+    elseif name === :not_int
+        v = resolve_value_or_const(lc, args[1])
+        v === nothing && error("not_int: unresolved operand")
+        return IR.result(_arith.xori(v, _const_like(v, _allones_of_elem(IR.type(v)))))
+    end
+    # Integer comparisons → emit_cmpi! with synthesized (pred, signedness).
+    name === :slt_int && return emit_cmpi!(lc, Any[args[1], args[2], CP.LessThan, SG.Signed], typ)
+    name === :sle_int && return emit_cmpi!(lc, Any[args[1], args[2], CP.LessThanOrEqual, SG.Signed], typ)
+    name === :ult_int && return emit_cmpi!(lc, Any[args[1], args[2], CP.LessThan, SG.Unsigned], typ)
+    name === :ule_int && return emit_cmpi!(lc, Any[args[1], args[2], CP.LessThanOrEqual, SG.Unsigned], typ)
+    name === :eq_int  && return emit_cmpi!(lc, Any[args[1], args[2], CP.Equal, SG.Signed], typ)
+    name === :ne_int  && return emit_cmpi!(lc, Any[args[1], args[2], CP.NotEqual, SG.Signed], typ)
+    name === Symbol("===") && return emit_cmpi!(lc, Any[args[1], args[2], CP.Equal, SG.Signed], typ)
+    # Float comparisons → emit_cmpf!.
+    name === :lt_float && return emit_cmpf!(lc, Any[args[1], args[2], CP.LessThan], typ)
+    name === :le_float && return emit_cmpf!(lc, Any[args[1], args[2], CP.LessThanOrEqual], typ)
+    name === :eq_float && return emit_cmpf!(lc, Any[args[1], args[2], CP.Equal], typ)
+    name === :ne_float && return emit_cmpf!(lc, Any[args[1], args[2], CP.NotEqual, ct.ComparisonOrdering.Unordered], typ)
+    # Width / type conversions. Raw arg order is (to_type, value).
+    if name === :sext_int || name === :zext_int || name === :trunc_int ||
+       name === :sitofp || name === :fptosi
+        target_T = something(resolve_const(lc, args[1]), args[1])
+        target_T isa Type || error("$name: target type must be a Type, got $(args[1])")
+        v = resolve_value_or_const(lc, args[2])
+        v === nothing && error("$name: unresolved operand $(args[2])")
+        out_t = _conv_out_type(v, target_T)
+        name === :sext_int  && return IR.result(_arith.extsi(v; out=out_t))
+        name === :zext_int  && return IR.result(_arith.extui(v; out=out_t))
+        name === :trunc_int && return IR.result(_arith.trunci(v; out=out_t))
+        name === :sitofp    && return IR.result(_arith.sitofp(v; out=out_t))
+        name === :fptosi    && return IR.result(_arith.fptosi(v; out=out_t))
+    elseif name === :bitcast
+        # Raw `bitcast(T, x)`; emit_bitcast! expects (value, type) → swap.
+        return emit_bitcast!(lc, Any[args[2], args[1]], typ)
+    elseif name === :ifelse
+        # Core.ifelse(c, x, y) → arith.select. Harmonise x/y, broadcast a
+        # scalar condition to the vector width if needed.
+        c = resolve_value_or_const(lc, args[1])
+        x = resolve_value_or_const(lc, args[2])
+        y = resolve_value_or_const(lc, args[3])
+        (c === nothing || x === nothing || y === nothing) &&
+            error("ifelse: unresolved operands")
+        x, y = _spmd_harmonise(lc, x, y)
+        if IR.isvector(IR.type(x)) && !IR.isvector(IR.type(c))
+            n = Int(size(IR.type(x), 1))
+            c = _broadcast_to_match(c, IR.VectorType(1, Int[n], IR.Type(Bool)))
+        end
+        return IR.result(_arith.select(c, x, y))
+    end
+    error("emit_raw_core_intrinsic!: name $name in raw set but unhandled")
 end
 
 # In SPMD mode, if one operand is a vector (varying) and the other is scalar
