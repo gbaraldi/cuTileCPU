@@ -1014,9 +1014,17 @@ end
 # unchanged — so a KA `__index_Global_Linear` overlay routed through this
 # entrypoint also works (with `__validindex` providing the `gid <= n`
 # guard or `true` for exact-multiple launches).
+# `ctx_arg`: when set, the lane comes from a *non*-trailing arg — the slot
+# is treated like the KA `__ctx__` (skipped as a func param, its value is
+# the synthesized global thread index via the `__cutilecpu_spmd_lane_id`
+# sentinel). This is how a KernelAbstractions `gpu_*` body lowers: the
+# `__index_Global_Linear(ctx)` overlay rewrites to the sentinel, and the
+# ctx itself is never referenced as data. When `ctx_arg === nothing` we
+# use the plain-Julia shape (trailing Integer `gid`).
 function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
                            kernel_name::String, module_name::String="kernels",
-                           lane_idx_type::Type=Int32)
+                           lane_idx_type::Type=Int32,
+                           ctx_arg::Union{Nothing,Int}=nothing)
     ctx = fresh_context()
     mod_ref = Ref{IR.Module}()
     param_julia_types = Type[]
@@ -1040,21 +1048,32 @@ function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
             global_attr = parse(IR.Attribute, "#gpu.address_space<global>")
             lane_t = mlir_elem_type(lane_idx_type)
 
-            # Identify the lane arg (trailing Integer) and classify the rest.
+            # Identify the lane arg. KA mode: the caller-supplied `ctx_arg`
+            # slot (the `__ctx__`). Plain mode: the trailing Integer (`gid`).
             lane_slot = 0
-            for (i, AT) in enumerate(sci.argtypes)
-                i == 1 && continue
-                widenconst(AT) <: Integer && (lane_slot = i)
+            if ctx_arg !== nothing
+                lane_slot = ctx_arg
+            else
+                for (i, AT) in enumerate(sci.argtypes)
+                    i == 1 && continue
+                    widenconst(AT) <: Integer && (lane_slot = i)
+                end
             end
             lane_slot == 0 && error(
                 "lower_to_mlir_gpu: kernel must end with a scalar global-index " *
-                "arg (e.g. `gid::Int32`)")
+                "arg (e.g. `gid::Int32`), or pass `ctx_arg` for the KA shape")
             lc.lane_arg = lane_slot
 
             param_mlir_types = IR.Type[]
             param_arg_slots = Int[]
             for (i, AT) in enumerate(sci.argtypes)
                 i == 1 && continue
+                # KA mode: the ctx slot is the lane and carries no data —
+                # skip it as a param. (In plain mode the lane is a trailing
+                # Integer, handled in the `Number` branch below.)
+                if ctx_arg !== nothing && i == lane_slot
+                    continue
+                end
                 if AT isa Core.Const
                     lc.arg_const[i] = AT.val
                     continue

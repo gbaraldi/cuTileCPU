@@ -35,24 +35,50 @@ struct cuTileBackend <: KA.GPU end
 # 2. Overlays into cuTile's method table
 # ----------------------------------------------------------------------------
 #
-# Sentinel function. The cuTileCPU walker recognises calls to this in SPMD/
-# KA mode and binds them to the lane vector synthesised at the top of the
-# scf.parallel body (see the `:__cutilecpu_spmd_lane_id` clause in
-# `src/lower.jl`).
-function __cutilecpu_spmd_lane_id end
+# Sentinel intrinsic. The cuTileCPU walker recognises calls to this (by
+# name) in SPMD/KA mode and binds them to the lane value — the lane vector
+# on the CPU path, or the scalar global thread index on the GPU path (see
+# the `:__cutilecpu_spmd_lane_id` clause in `src/lower.jl`).
+#
+# It must be defined INSIDE `cuTile.Intrinsics`, with an opaque
+# `compilerbarrier(:type, nothing)` body + a `cuTile.tfunc` return-type
+# override — i.e. exactly what cuTile's `@intrinsic` macro generates. The
+# `Intrinsics`-module membership is load-bearing: cuTile's interpreter
+# only marks calls as `CC.NoCallInfo()` (keeping them as `Expr(:call)`,
+# un-inlined) when `parentmodule(f) === Intrinsics` (see `isintrinsic` in
+# cuTile/src/compiler/interpreter.jl). A function of the same shape defined
+# anywhere else gets normal call info and is inlined away — its body
+# leaks into the structured IR and the walker never sees a call to
+# intercept.
+#
+# Creating a *new binding* inside `cuTile.Intrinsics` via `eval` is illegal
+# during the extension's PRECOMPILE (Julia forbids mutating another
+# module's bindings then). So we do it at runtime in `__init__`, where
+# cross-module eval is allowed. (A cleaner long-term fix is to vendor
+# cuTile's interpreter/intrinsic machinery into a shared layer so cuTileCPU
+# owns intrinsic definition — design-doc step 4.) The `__index_Global_Linear`
+# overlay references the intrinsic, so it too is installed in `__init__`.
+function __init__()
+    Core.eval(cuTile.Intrinsics, quote
+        @noinline __cutilecpu_spmd_lane_id() = $(Base.compilerbarrier)(:type, nothing)
+    end)
+    @eval begin
+        const __cutilecpu_spmd_lane_id = cuTile.Intrinsics.__cutilecpu_spmd_lane_id
+        # Return-type override consulted by cuTileInterpreter (`tfunc(𝕃,f,…)`).
+        cuTile.tfunc(𝕃, ::typeof(cuTile.Intrinsics.__cutilecpu_spmd_lane_id)) = Int32
+        # `__index_Global_Linear(ctx)` → the global linear thread index.
+        @overlay ct.cuTileMethodTable KA.__index_Global_Linear(ctx) =
+            cuTile.Intrinsics.__cutilecpu_spmd_lane_id()
+    end
+    return
+end
 
 # `__validindex(ctx)` — for launches where ndrange is a multiple of the
 # workgroup size, every lane is valid. Tighter (lane < ndrange) handling is
 # a TODO; the kernel would need to thread `ndrange` through as a uniform
 # scalar arg and we'd emit a vector compare + `vector.gather`/`scatter` with
-# a per-lane mask.
+# a per-lane mask. (No intrinsic reference → safe at precompile.)
 @overlay ct.cuTileMethodTable KA.__validindex(ctx) = true
-
-# `__index_Global_Linear(ctx)` — the global linear thread index (1-based on
-# the SPMD path; cuTileCPU's lane vector is already 1-based for Julia
-# semantics).
-@overlay ct.cuTileMethodTable KA.__index_Global_Linear(ctx) =
-    __cutilecpu_spmd_lane_id()
 
 # `__synchronize()` — CPU SIMD has no warp barrier. For kernels without
 # cross-lane communication this is a no-op. Kernels that depend on a real
