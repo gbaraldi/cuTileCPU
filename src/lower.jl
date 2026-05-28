@@ -1887,7 +1887,13 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
         fname === :group_ntuple) && lc.spmd
         kind = fname === :global_ntuple ? :global :
                fname === :local_ntuple  ? :local : :group
-        lc.ssa_multi[idx] = _emit_nd_index!(lc, kind)
+        # Grid rank N is carried by the marker's `Val{N}` arg (the only source
+        # on the GPU path, where lc.wg_dims is empty).
+        a1 = args[1]
+        N = a1 isa Val ? Int(typeof(a1).parameters[1]) :
+            (a1 isa Type && a1 <: Val) ? Int(a1.parameters[1]) :
+            error("ntuple @index: expected Val{N} marker arg, got $a1 :: $(typeof(a1))")
+        lc.ssa_multi[idx] = _emit_nd_index!(lc, kind, N)
         return nothing
     end
 
@@ -3952,17 +3958,55 @@ end
 # enumeration order of work-items is irrelevant — each computes its own output —
 # so this need only be a bijection onto the ndrange, which per-dim divisibility
 # (checked in the launcher) guarantees.
-function _emit_nd_index!(lc::LowerCtx, kind::Symbol)
+function _emit_nd_index!(lc::LowerCtx, kind::Symbol, N::Int)
+    # The `@index(…, NTuple)` markers return `NTuple{N,Int}` (Julia `Int` =
+    # Int64), so the per-dim components must be Int64 to match the IR's
+    # linearisation arithmetic — NOT `lc.lane_idx_type` (which is Int32 on the
+    # GPU path for the `gid ≤ n` linear-index compare). On the CPU path Int ==
+    # lane_idx_type, so this is unchanged there.
+    idx_jl = Int
+    lane_t = mlir_elem_type(idx_jl)
+    idx_t = IR.IndexType()
+
+    # ---- GPU SIMT (lane_width == 1): each thread reads its own N-D coordinate
+    # directly from the gpu intrinsics (Julia dim d ↔ gpu dim x/y/z). No flat-
+    # lane unflatten; everything is a scalar per thread. 1-based. ----
+    if lc.lane_width == 1
+        N <= 3 || error("N-D GPU @index: rank $N > 3 (no w dim)")
+        dimnames = ("x", "y", "z")
+        one_idx() = IR.result(_arith.constant(; value=IR.Attribute(1, idx_t)))
+        tolane(v) = IR.result(_arith.index_cast(v; out=lane_t))
+        out = IR.Value[]
+        for d in 1:N
+            da = parse(IR.Attribute, "#gpu<dim $(dimnames[d])>")
+            if kind === :local
+                tid = IR.result(_gpu.thread_id(; result_0=idx_t, dimension=da))
+                push!(out, tolane(IR.result(_arith.addi(tid, one_idx(); result=idx_t))))
+            elseif kind === :group
+                bid = IR.result(_gpu.block_id(; result_0=idx_t, dimension=da))
+                push!(out, tolane(IR.result(_arith.addi(bid, one_idx(); result=idx_t))))
+            else
+                kind === :global || error("_emit_nd_index!: bad kind $kind")
+                tid  = IR.result(_gpu.thread_id(; result_0=idx_t, dimension=da))
+                bid  = IR.result(_gpu.block_id(; result_0=idx_t, dimension=da))
+                bdim = IR.result(_gpu.block_dim(; result_0=idx_t, dimension=da))
+                off  = IR.result(_arith.muli(bid, bdim; result=idx_t))
+                g0   = IR.result(_arith.addi(off, tid; result=idx_t))
+                push!(out, tolane(IR.result(_arith.addi(g0, one_idx(); result=idx_t))))
+            end
+        end
+        return out
+    end
+
+    # ---- CPU SPMD: column-major unflatten of the flat `vector<W>` lane. ----
     wg, nd = lc.wg_dims, lc.nd_dims
-    N = length(wg)
-    N == length(nd) ||
-        error("_emit_nd_index!: wg_dims $(wg) / nd_dims $(nd) rank mismatch")
-    lane_t = mlir_elem_type(lc.lane_idx_type)
+    length(wg) == N == length(nd) ||
+        error("_emit_nd_index!: rank mismatch (marker N=$N, wg=$(wg), nd=$(nd))")
     W = prod(wg)
     vec_t = IR.VectorType(1, Int[W], lane_t)
     scalar(c) = IR.result(_arith.constant(; value=IR.Attribute(Int(c), lane_t)))
     splat(c)  = IR.result(_vector.broadcast(scalar(c); vector=vec_t))
-    step  = _emit_step_vec(vec_t, lc.lane_idx_type, W)            # 0..W-1 vector
+    step  = _emit_step_vec(vec_t, idx_jl, W)                      # 0..W-1 vector
     bid_i = IR.result(_arith.index_cast(lc.bids[1]; out=lane_t))  # 0-based scalar
     gridsz = Int[nd[d] ÷ wg[d] for d in 1:N]
 
@@ -4115,7 +4159,10 @@ function _flatten_memref(base::IR.Value)
         total = IR.result(_arith.muli(total, dimc(d); result=idx_t))
     end
     elem = eltype(bt)
-    res_t = IR.MemRefType(elem, Int[Int(IR.dynsize())], IR.Attribute(), IR.Attribute())
+    # Preserve the source memref's memory space (e.g. `#gpu.address_space<global>`
+    # on the GPU path) — reinterpret_cast requires matching spaces.
+    memspace = IR.Attribute(MLIR.API.mlirMemRefTypeGetMemorySpace(bt))
+    res_t = IR.MemRefType(elem, Int[Int(IR.dynsize())], IR.Attribute(), memspace)
     return IR.result(_memref.reinterpret_cast(
         base, IR.Value[], IR.Value[total], IR.Value[];
         result=res_t,

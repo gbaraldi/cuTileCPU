@@ -119,8 +119,12 @@ function _push_memref!(flat, sig, arr::CuArray)
     push!(flat, p);          push!(sig, Culonglong)   # allocated ptr
     push!(flat, p);          push!(sig, Culonglong)   # aligned ptr
     push!(flat, UInt64(0));  push!(sig, Culonglong)   # offset (elements)
-    for s in size(arr);    push!(flat, UInt64(s)); push!(sig, Culonglong); end
-    for s in strides(arr); push!(flat, UInt64(s)); push!(sig, Culonglong); end
+    # The kernel addresses the array via Julia (column-major) linearisation and
+    # reads `size(a,k)` as `memref.dim(a, N-k)` (Julia↔MLIR dim reversal). So the
+    # LLVM descriptor's sizes/strides must be in REVERSED Julia order. (For a
+    # 1-D arg `reverse` is a no-op, so vadd is unchanged.)
+    for s in reverse(size(arr));    push!(flat, UInt64(s)); push!(sig, Culonglong); end
+    for s in reverse(strides(arr)); push!(flat, UInt64(s)); push!(sig, Culonglong); end
     return nothing
 end
 

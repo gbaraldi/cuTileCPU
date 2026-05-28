@@ -2320,4 +2320,58 @@ end
         end
     end
 
+    # GPU SIMT path (MLIRCUDABackend): a KA @kernel compiled through the MLIR
+    # gpu dialect → PTX and run on the device. Scalar-per-thread, so N-D @index
+    # + A[i,j] + a reduction accumulator all work with no uniform/varying
+    # harmonization. Guarded on a functional CUDA device (skips otherwise).
+    @testset "GPU: KA @kernel on MLIRCUDABackend (SIMT)" begin
+        gpu_ok = try
+            @eval using CUDA, LLVM
+            @eval using KernelAbstractions
+            CUDA.functional()
+        catch
+            false
+        end
+        if !gpu_ok
+            @info "CUDA not functional in this env — skipping GPU backend test"
+            @test true
+        else
+            GPUB = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRCUDABackend
+            @eval begin
+                @kernel function _g_vadd!(c, @Const(a), @Const(b))
+                    i = @index(Global, Linear)
+                    @inbounds c[i] = a[i] + b[i]
+                end
+                @kernel function _g_transpose!(a, @Const(b))
+                    i, j = @index(Global, NTuple)
+                    @inbounds a[i, j] = b[j, i]
+                end
+                @kernel function _g_matmul!(out, @Const(a), @Const(b))
+                    i, j = @index(Global, NTuple)
+                    tmp = zero(eltype(out))
+                    for k in 1:size(a, 2)
+                        @inbounds tmp += a[i, k] * b[k, j]
+                    end
+                    @inbounds out[i, j] = tmp
+                end
+            end
+            # 1-D vadd
+            N = 4096
+            a1 = CUDA.CuArray(rand(Float32, N)); b1 = CUDA.CuArray(rand(Float32, N))
+            c1 = CUDA.zeros(Float32, N)
+            (@eval _g_vadd!)(GPUB(), 256)(c1, a1, b1; ndrange=N); CUDA.synchronize()
+            @test Array(c1) == Array(a1) .+ Array(b1)
+            # 2-D transpose (non-square) — catches descriptor dim-order
+            bh = reshape(collect(Float32, 1:32), 8, 4)
+            bt = CUDA.CuArray(bh); at = CUDA.zeros(Float32, 4, 8)
+            (@eval _g_transpose!)(GPUB(), (4, 4))(at, bt; ndrange=(4, 8)); CUDA.synchronize()
+            @test Array(at) == permutedims(bh)
+            # 2-D matmul (non-square) — scalar accumulator over a for-loop
+            ah = rand(Float32, 8, 4); bbh = rand(Float32, 4, 6)
+            am = CUDA.CuArray(ah); bm = CUDA.CuArray(bbh); om = CUDA.zeros(Float32, 8, 6)
+            (@eval _g_matmul!)(GPUB(), (4, 2))(om, am, bm; ndrange=(8, 6)); CUDA.synchronize()
+            @test maximum(abs.(Array(om) .- ah * bbh)) < 1f-3
+        end
+    end
+
 end
