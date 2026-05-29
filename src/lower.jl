@@ -737,7 +737,12 @@ function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
                     continue
                 end
                 AT_wide = widenconst(AT)
-                if AT_wide <: AbstractArray
+                # `DenseArray` (Array, CuArray, …) is memory-backed → memref.
+                # Lazy AbstractArrays (ranges like `OneTo`/`UnitRange`, the
+                # `eachindex(A)` a kernel iterates) are NOT DenseArrays — they
+                # fall to the struct-flatten branch below, where `length`/`[i]`
+                # resolve from their captured fields (e.g. OneTo's `.stop`).
+                if AT_wide <: DenseArray
                     eT = eltype(AT_wide)
                     N  = ndims(AT_wide)
                     shape = fill(Int(IR.dynsize()), N)
@@ -768,7 +773,7 @@ function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
                         FT = fieldtype(AT_wide, fn)
                         Base.issingletontype(FT) && continue
                         syn_counter -= 1; syn = syn_counter
-                        if FT <: AbstractArray
+                        if FT <: DenseArray
                             eTc = eltype(FT); Nc = ndims(FT)
                             mrc = IR.MemRefType(mlir_elem_type(eTc),
                                                 fill(Int(IR.dynsize()), Nc),
