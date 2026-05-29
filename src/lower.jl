@@ -1304,6 +1304,11 @@ function walk_stmt!(lc::LowerCtx, idx::Int, @nospecialize(stmt), @nospecialize(t
             return get(lc.arg_vals, inner.n, nothing)
         end
         return resolve_value_or_const(lc, inner)
+    elseif stmt isa Number || stmt isa Bool
+        # A bare literal bound to an SSA (e.g. `%6 = 4`) — arises from loop
+        # transformations like `@simd`/`@unroll`. Materialise the constant so
+        # downstream uses resolve.
+        return resolve_value_or_const(lc, stmt)
     end
     error("MLIRKernels.walk_stmt!: unhandled stmt $stmt at %$idx (typ=$typ)")
 end
@@ -1323,6 +1328,12 @@ function walk_expr!(lc::LowerCtx, idx::Int, e::Expr, @nospecialize(typ))
         # markers (`Expr(:aliasscope)` ... `Expr(:popaliasscope)`). They carry
         # noalias metadata for LLVM but have no MLIR analogue here — the memref
         # ABI already encodes the (non-aliasing) argument buffers. Drop them.
+        return nothing
+    elseif e.head === :loopinfo
+        # `@simd` / KA's `@unroll` (KernelAbstractions.Extras) annotate the loop
+        # body with an `Expr(:loopinfo, "julia.simdloop"/"julia.unroll", …)`
+        # hint. It's a pure optimisation directive (the loop is semantically a
+        # plain scf.for); drop it and let LLVM/ptxas unroll/vectorise.
         return nothing
     end
     error("MLIRKernels.walk_expr!: unhandled Expr head :$(e.head) at %$idx ($e)")

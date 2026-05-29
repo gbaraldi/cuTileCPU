@@ -2505,6 +2505,31 @@ end
                 reft[bi*16+ai, bj*16+aj] = iht[bi*16+aj, bj*16+ai]
             end
             @test Array(ott) == reft                               # 2-D tile cross-lane transpose
+
+            # @simd / @unroll loops: the loopinfo hint is dropped (the loop is a
+            # plain scf.for); LLVM/ptxas unroll. Both forms over a Val{M} bound.
+            @eval begin
+                @kernel function _g_simdsum!(o, @Const(a), ::Val{M}) where {M}
+                    Ix = @index(Global, Linear); ac = zero(eltype(o))
+                    @simd for k in 1:M; @inbounds ac += a[Ix] * k; end
+                    @inbounds o[Ix] = ac
+                end
+                @kernel function _g_unrollsum!(o, @Const(a), ::Val{M}) where {M}
+                    Ix = @index(Global, Linear); ac = zero(eltype(o))
+                    KernelAbstractions.Extras.@unroll for k in 1:M
+                        @inbounds ac += a[Ix] * k
+                    end
+                    @inbounds o[Ix] = ac
+                end
+            end
+            Ns = 64; Ws = 16; Ms = 4
+            as = CUDA.CuArray(collect(1:Ns)); refs = [Array(as)[k]*sum(1:Ms) for k in 1:Ns]
+            os1 = CUDA.zeros(Int, Ns)
+            (@eval _g_simdsum!)(GPUB(), Ws)(os1, as, Val(Ms); ndrange=Ns); CUDA.synchronize()
+            @test Array(os1) == refs                               # @simd
+            os2 = CUDA.zeros(Int, Ns)
+            (@eval _g_unrollsum!)(GPUB(), Ws)(os2, as, Val(Ms); ndrange=Ns); CUDA.synchronize()
+            @test Array(os2) == refs                               # @unroll
         end
     end
 
