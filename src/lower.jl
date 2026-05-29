@@ -100,6 +100,17 @@ mutable struct LowerCtx
     # gpu-to-nvvm lowers to real `.shared` — unlike `memref.alloca(workgroup)`,
     # which mis-lowers to a per-thread local depot. `nothing` on the CPU path.
     gpu_module_block::Union{Nothing, IR.Block}
+    # ----- closure / functor kernel args -----
+    # A closure arg (e.g. the `f`/`op` passed to map/reduce) is flattened: each
+    # captured field that's an array or scalar becomes its own func param at a
+    # synthetic (negative) arg slot, bound in arg_vals/arg_elem_types; singleton
+    # captures (the user function) inline away. `captured` maps
+    # (closure_slot, fieldname) → (synthetic_slot, :memref|:scalar). `array_ssa`
+    # maps the SSA of a `getfield(closure, :array_field)` to its synthetic slot,
+    # so the result reuses the array-arg indexing path (its :ref/:size resolve
+    # to the synthetic slot's memref).
+    captured::Dict{Tuple{Int, Symbol}, Tuple{Int, Symbol}}
+    array_ssa::Dict{Int, Int}
 end
 
 LowerCtx(ctx, mod) = LowerCtx(
@@ -113,7 +124,8 @@ LowerCtx(ctx, mod) = LowerCtx(
     IR.Value[],
     false, 16, 0, Int64,
     Int[], Int[],
-    Dict{Int, Tuple{IR.Value, Type, Vector{Int}}}(), nothing)
+    Dict{Int, Tuple{IR.Value, Type, Vector{Int}}}(), nothing,
+    Dict{Tuple{Int, Symbol}, Tuple{Int, Symbol}}(), Dict{Int, Int}())
 
 # ----------------------------------------------------------------------------
 # Type translation: Julia → MLIR
@@ -711,6 +723,7 @@ function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
 
             param_mlir_types = IR.Type[]
             param_arg_slots = Int[]
+            syn_counter = 0    # synthetic (negative) slots for closure captures
             for (i, AT) in enumerate(sci.argtypes)
                 i == 1 && continue
                 # KA mode: the ctx slot is the lane and carries no data —
@@ -745,7 +758,35 @@ function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
                         push!(param_kinds, :scalar)
                     end
                 else
-                    error("MLIRKernels GPU: unsupported arg type $AT_wide at slot $i")
+                    # Closure / functor: flatten captured fields into their own
+                    # params. Array/scalar captures → memref/scalar params at
+                    # synthetic (negative) slots; singleton captures (e.g. a
+                    # captured user function) inline away and need no param.
+                    (isstructtype(AT_wide) && !isempty(fieldnames(AT_wide))) ||
+                        error("MLIRKernels GPU: unsupported arg type $AT_wide at slot $i")
+                    for fn in fieldnames(AT_wide)
+                        FT = fieldtype(AT_wide, fn)
+                        Base.issingletontype(FT) && continue
+                        syn_counter -= 1; syn = syn_counter
+                        if FT <: AbstractArray
+                            eTc = eltype(FT); Nc = ndims(FT)
+                            mrc = IR.MemRefType(mlir_elem_type(eTc),
+                                                fill(Int(IR.dynsize()), Nc),
+                                                IR.Attribute(), global_attr)
+                            push!(param_mlir_types, mrc); push!(param_arg_slots, syn)
+                            push!(param_julia_types, FT); push!(param_kinds, :memref)
+                            lc.arg_elem_types[syn] = eTc
+                            lc.captured[(i, fn)] = (syn, :memref)
+                        elseif FT <: Number
+                            push!(param_mlir_types, mlir_elem_type(FT))
+                            push!(param_arg_slots, syn)
+                            push!(param_julia_types, FT); push!(param_kinds, :scalar)
+                            lc.captured[(i, fn)] = (syn, :scalar)
+                        else
+                            error("MLIRKernels GPU: closure capture $fn::$FT " *
+                                  "at slot $i unsupported")
+                        end
+                    end
                 end
             end
 
@@ -1655,9 +1696,28 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
         fld_sym = field isa QuoteNode ? field.value :
                   field isa Symbol    ? field :
                   error("getfield: field must be Symbol/QuoteNode, got $field")
+        # Closure/functor capture: `getfield(closure_arg, :field)` for a field
+        # flattened into its own param at signature time.
+        if haskey(lc.captured, (obj.n, fld_sym))
+            (syn, knd) = lc.captured[(obj.n, fld_sym)]
+            if knd === :memref
+                lc.array_ssa[idx] = syn      # reuse the array-arg indexing path
+                return nothing
+            else                              # :scalar
+                return lc.arg_vals[syn]
+            end
+        end
         lc.field_refs[idx] = (obj.n, fld_sym)
         return nothing
     elseif obj isa SSAValue
+        # A captured-array field (the SSA of `getfield(closure, :arr)`): index it
+        # exactly like the array arg at its synthetic slot — `:ref`/`:size` get
+        # recorded in field_refs so memoryrefnew + memref.dim route to that slot.
+        if haskey(lc.array_ssa, obj.id)
+            fld = args[2] isa QuoteNode ? args[2].value : args[2]
+            lc.field_refs[idx] = (lc.array_ssa[obj.id], fld)
+            return nothing
+        end
         # `@localmem`/`@private`-rooted getfield on a local-buffer marker:
         #   :ref  → propagate the buffer mapping (memoryrefnew routes to it).
         #   :size → the buffer's STATIC dims as a tracked constant tuple, so

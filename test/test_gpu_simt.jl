@@ -141,6 +141,19 @@ end
     end
     @inbounds C[I, J] = acc
 end
+# Closure/functor kernel arg: the kernel calls a closure `f` that captures
+# device arrays (the map/reduce/broadcast pattern). The closure is flattened
+# into its captured array params; the call inlines.
+@kernel function _g_applyclos!(out, f)
+    i = @index(Global, Linear)
+    @inbounds out[i] = f(i)
+end
+@kernel function _g_mapclos!(n, f)
+    i = @index(Global, Linear)
+    if i <= n
+        f(i)
+    end
+end
 
 @testset "GPU: KA @kernel on MLIRCUDABackend (SIMT)" begin
     if !CUDA.functional()
@@ -241,5 +254,17 @@ end
         _g_vadd!(KernelAbstractions.get_backend(wa), 256)(wc, wa, wb; ndrange=1024)
         CUDA.synchronize()
         @test Array(wc) ≈ Array(wa) .+ Array(wb)               # wrapper auto-dispatch
+
+        # Closure kernel args (the map/reduce pattern): a closure capturing 1 or
+        # 2 device arrays, flattened into memref params; the call inlines.
+        csrc = CUDA.CuArray(collect(Float32, 1:1024))
+        cg = let s = csrc; i -> 2f0 * s[i]; end
+        cout = CUDA.zeros(Float32, 1024)
+        _g_applyclos!(GPUB(), 256)(cout, cg; ndrange=1024); CUDA.synchronize()
+        @test Array(cout) ≈ 2f0 .* (1:1024)                    # 1-capture closure
+        cdst = CUDA.zeros(Float32, 1024); csrc2 = CUDA.CuArray(collect(Float32, 1:1024))
+        ch = let d = cdst, s = csrc2; i -> (@inbounds d[i] = 3f0 * s[i]); end
+        _g_mapclos!(GPUB(), 256)(1024, ch; ndrange=1024); CUDA.synchronize()
+        @test Array(cdst) ≈ 3f0 .* (1:1024)                    # 2-capture closure + write
     end
 end

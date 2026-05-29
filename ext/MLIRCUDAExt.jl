@@ -212,21 +212,39 @@ function _push_memref!(flat, sig, arr::CuArray)
     return nothing
 end
 
+# Flatten a launch arg to match the flattened param list (see
+# lower_to_mlir_gpu): drop singletons (`Val`/`Type`/captured user fns — folded
+# as Core.Const), unwrap arrays to their CuArray, and expand a closure/functor
+# into its captured array+scalar fields (fieldname order — matching the
+# signature flattening).
+function _flatten_args!(out, @nospecialize(a))
+    Base.issingletontype(typeof(a)) && return out
+    au = unwrap(a)
+    if au isa CuArray || au isa Number
+        push!(out, au)
+    elseif isstructtype(typeof(a))
+        for fn in fieldnames(typeof(a))
+            _flatten_args!(out, getfield(a, fn))
+        end
+    else
+        error("MLIRCUDABackend: cannot marshal arg of type $(typeof(a))")
+    end
+    return out
+end
+
 function _marshal(args, kinds)
-    # `kinds` is one symbol per *param* (memref/scalar). Compile-time-constant
-    # args — singletons like `::Val{M}` / `::Type{T}` used only for dispatch —
-    # are NOT runtime params (lower_to_mlir_gpu folds them in as Core.Const), so
-    # drop them here too; the rest line up 1:1 with `kinds`.
-    args = Tuple(a for a in args if !Base.issingletontype(typeof(a)))
-    length(kinds) == length(args) ||
-        error("MLIRCUDABackend: $(length(kinds)) params vs $(length(args)) args")
+    # `kinds` is one symbol per flattened *param* (memref/scalar). Flatten the
+    # runtime args the same way the signature was flattened, then they line up.
+    flat_vals = Any[]
+    for a in args; _flatten_args!(flat_vals, a); end
+    length(kinds) == length(flat_vals) ||
+        error("MLIRCUDABackend: $(length(kinds)) params vs $(length(flat_vals)) marshalled values")
     flat = Any[]; sig = DataType[]
-    for (a, k) in zip(args, kinds)
+    for (a, k) in zip(flat_vals, kinds)
         if k === :memref
-            arr = unwrap(a)
-            arr isa CuArray ||
-                error("MLIRCUDABackend: memref param expects a CuArray/MLIRArray, got $(typeof(a))")
-            _push_memref!(flat, sig, arr)
+            a isa CuArray ||
+                error("MLIRCUDABackend: memref param expects a CuArray, got $(typeof(a))")
+            _push_memref!(flat, sig, a)
         elseif k === :scalar
             push!(flat, a); push!(sig, typeof(a))
         else
@@ -244,7 +262,22 @@ end
 # the host `Array` of the same eltype/rank (which lowers identically).
 _host_argtype(::Type{<:CuArray{T,N}}) where {T,N} = Array{T,N}
 _host_argtype(::Type{<:MLIRArray{T,N}}) where {T,N} = Array{T,N}
-_host_argtype(@nospecialize(T::Type)) = T
+function _host_argtype(@nospecialize(T::Type))
+    # A closure/functor capturing device arrays: its type params ARE the
+    # captured field types, so rebuild it with each device-array param remapped
+    # to a host Array. Then inference indexes the captures via Array's getindex
+    # (no GPUArrays.assertscalar in the kernel IR), while marshalling still
+    # unwraps the real device arrays. Element type/ndims are unchanged, so the
+    # flattened memref params match.
+    if T <: Function && isstructtype(T) && !isempty(T.parameters)
+        try
+            return T.name.wrapper{map(_host_argtype, collect(T.parameters))...}
+        catch
+            return T
+        end
+    end
+    return T
+end
 
 function _resolve_wgsize(obj::KA.Kernel{MLIRCUDABackend}, workgroupsize)
     wg_T = KA.workgroupsize(obj)
