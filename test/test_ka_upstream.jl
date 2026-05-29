@@ -10,10 +10,10 @@
 # runnable kernels, exactly as KA's own backend testsuites are structured.
 # Kernels are defined at top level; only execution is guarded on CUDA.functional().
 using CUDA, LLVM, KernelAbstractions
-using KernelAbstractions: @localmem, @synchronize, @uniform, @groupsize, @private
+using KernelAbstractions: @localmem, @synchronize, @uniform, @groupsize, @private, get_backend
 using KernelAbstractions.Extras: @unroll
 
-const KAU_GPUB = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRCUDABackend
+const MLIRArray = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRArray
 
 # KA test/test.jl — index_linear_global (multiple-of-wg case)
 @kernel function _ka_index_linear_global(A)
@@ -57,8 +57,10 @@ end
         @info "CUDA not functional — skipping KA upstream testsuite"
         @test true
     else
-        b = KAU_GPUB()
-        AT = CUDA.CuArray
+        # Backend inferred from MLIRArray data via get_backend (the wrapper
+        # auto-dispatch path); buffers are the backend's MLIRArray, from its
+        # allocate or by wrapping a device array.
+        b = get_backend(MLIRArray(CUDA.CuArray{Int}(undef, 1)))
 
         # (1) index: A[I] = I over a length-256 array, wg=8 (256 = 32*8)
         A = KernelAbstractions.allocate(b, Int, 16, 16)
@@ -67,28 +69,29 @@ end
         @test Array(A) == collect(LinearIndices(A))
 
         # (2) localmem: each 16-wide group reversed; ndrange 64 = 4*16
-        A = AT{Int}(undef, 64)
+        A = KernelAbstractions.allocate(b, Int, 64)
         _ka_localmem(b, 16)(A; ndrange=size(A))
         KernelAbstractions.synchronize(b)
         Bv = Array(A)
         @test all(Bv[g*16+1:g*16+16] == collect(16:-1:1) for g in 0:3)
 
         # (3) private: per-thread scratch, same reversal pattern
-        A = AT{Int}(undef, 64)
+        A = KernelAbstractions.allocate(b, Int, 64)
         _ka_private(b, 16)(A; ndrange=size(A))
         KernelAbstractions.synchronize(b)
         @test Array(A)[1:16] == collect(16:-1:1)
 
         # (4) copyto!: host↔device round-trip via KA.copyto!
         M = 1024
-        Ad = AT(rand(Float32, M)); Bd = AT(rand(Float32, M)); h = Array{Float32}(undef, M)
+        Ad = MLIRArray(CUDA.CuArray(rand(Float32, M)))
+        Bd = MLIRArray(CUDA.CuArray(rand(Float32, M))); h = Array{Float32}(undef, M)
         KernelAbstractions.copyto!(b, h, Bd)
         KernelAbstractions.copyto!(b, Ad, h)
         KernelAbstractions.synchronize(b)
         @test isapprox(h, Array(Ad)) && isapprox(h, Array(Bd))
 
         # (5) @unroll: static-ndrange kernel `kernel(b, 1, 1)(a)` (no ndrange kwarg)
-        a = AT(zeros(Float32, 5))
+        a = MLIRArray(CUDA.zeros(Float32, 5))
         _ka_kernel_unroll!(b, 1, 1)(a)
         KernelAbstractions.synchronize(b)
         @test Array(a) == Float32[1, 2, 3, 4, 5]

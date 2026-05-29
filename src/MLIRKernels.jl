@@ -17,7 +17,7 @@ targets two backends:
 
 ```julia
 using KernelAbstractions, CUDA, MLIRKernels
-const GPU = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRCUDABackend
+const MLIRArray = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRArray
 
 @kernel function vadd!(c, @Const(a), @Const(b))
     i = @index(Global, Linear)
@@ -25,8 +25,9 @@ const GPU = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRCUDABackend
 end
 
 n = 1024
-a = CUDA.rand(Float32, n); b = CUDA.rand(Float32, n); c = CUDA.zeros(Float32, n)
-vadd!(GPU(), 256)(c, a, b; ndrange=n); CUDA.synchronize()
+# Inputs are MLIRArrays, so the backend is inferred from the data via get_backend.
+a = MLIRArray(CUDA.rand(Float32, n)); b = MLIRArray(CUDA.rand(Float32, n)); c = MLIRArray(CUDA.zeros(Float32, n))
+vadd!(get_backend(a), 256)(c, a, b; ndrange=n); CUDA.synchronize()
 @assert Array(c) ≈ Array(a) .+ Array(b)
 ```
 
@@ -36,7 +37,7 @@ vadd!(GPU(), 256)(c, a, b; ndrange=n); CUDA.synchronize()
 # CPU SPMD path:
 println(code_mlir(spmd_kernel, (Vector{Float32}, Vector{Float32}, Int)))
 # GPU SIMT path — IR at any level (:sci, :mlir, :lowered, :llvm, :ptx):
-println(code_gpu(vadd!(GPU(), 256), c, a, b; ndrange=n, level=:ptx))
+println(code_gpu(vadd!(get_backend(a), 256), c, a, b; ndrange=n, level=:ptx))
 ```
 """
 module MLIRKernels

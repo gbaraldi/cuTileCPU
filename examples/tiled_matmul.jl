@@ -5,6 +5,7 @@ using LinearAlgebra
 const KA = KernelAbstractions
 const ext = Base.get_extension(MLIRKernels, :MLIRCUDAExt)
 const MLIRB = ext.MLIRCUDABackend
+const MLIRArray = ext.MLIRArray
 @assert CUDA.functional()
 
 # ---- naive (already validated; one thread per output element) --------------
@@ -57,16 +58,20 @@ end
 
 function run()
     println("# tiled matmul — correctness")
+    # Inputs are MLIRArrays, so the backend is inferred from the data.
     for n in (256, 512, 1024)
-        A = CUDA.rand(Float32, n, n); B = CUDA.rand(Float32, n, n)
+        A = MLIRArray(CUDA.rand(Float32, n, n)); B = MLIRArray(CUDA.rand(Float32, n, n))
         Cref = Array(A) * Array(B)
-        Ct = CUDA.zeros(Float32, n, n)
-        mm_tiled!(MLIRB(), (TILE, TILE))(Ct, A, B; ndrange=(n, n)); CUDA.synchronize()
+        Ct = MLIRArray(CUDA.zeros(Float32, n, n))
+        mm_tiled!(get_backend(A), (TILE, TILE))(Ct, A, B; ndrange=(n, n)); CUDA.synchronize()
         ok = isapprox(Array(Ct), Cref; rtol=1f-2)
         println("  n=$n tiled correct: ", ok, ok ? "" : "  MAXERR=$(maximum(abs.(Array(Ct).-Cref)))")
         @assert ok
     end
 
+    # The perf comparison runs the same kernel on two backends + CUBLAS over the
+    # same CuArrays, so it names the backends explicitly (a wrapped array would
+    # misroute the CUDA.jl / CUBLAS launches).
     println("\n# perf (GFLOP/s, min of 100)")
     for n in (512, 1024, 2048)
         A = CUDA.rand(Float32, n, n); B = CUDA.rand(Float32, n, n)

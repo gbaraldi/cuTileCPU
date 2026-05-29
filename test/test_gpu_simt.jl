@@ -4,7 +4,7 @@
 # Kernels are defined at top level; only execution is guarded on a functional
 # CUDA device (skips otherwise).
 using CUDA, LLVM, KernelAbstractions, Atomix
-using KernelAbstractions: @localmem, @synchronize, @uniform, @groupsize, @private
+using KernelAbstractions: @localmem, @synchronize, @uniform, @groupsize, @private, get_backend
 using KernelAbstractions.Extras: @unroll
 
 const GPUB = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRCUDABackend
@@ -170,61 +170,66 @@ end
         @info "CUDA not functional in this env — skipping GPU backend test"
         @test true
     else
+        # Every input is an MLIRArray, so KernelAbstractions.get_backend infers
+        # MLIRCUDABackend from the data — no backend type is named at the call
+        # sites (the path GPUArrays / AcceleratedKernels take).
         # 1-D vadd
         N = 4096
-        a1 = CUDA.CuArray(rand(Float32, N)); b1 = CUDA.CuArray(rand(Float32, N))
-        c1 = CUDA.zeros(Float32, N)
-        _g_vadd!(GPUB(), 256)(c1, a1, b1; ndrange=N); CUDA.synchronize()
+        a1 = MLIRArray(CUDA.rand(Float32, N)); b1 = MLIRArray(CUDA.rand(Float32, N))
+        c1 = MLIRArray(CUDA.zeros(Float32, N))
+        backend = get_backend(a1)
+        @test backend isa GPUB                            # auto-dispatch → MLIRCUDABackend
+        _g_vadd!(backend, 256)(c1, a1, b1; ndrange=N); CUDA.synchronize()
         @test Array(c1) == Array(a1) .+ Array(b1)
         # 2-D transpose (non-square) — catches descriptor dim-order
         bh = reshape(collect(Float32, 1:32), 8, 4)
-        bt = CUDA.CuArray(bh); at = CUDA.zeros(Float32, 4, 8)
-        _g_transpose!(GPUB(), (4, 4))(at, bt; ndrange=(4, 8)); CUDA.synchronize()
+        bt = MLIRArray(CUDA.CuArray(bh)); at = MLIRArray(CUDA.zeros(Float32, 4, 8))
+        _g_transpose!(backend, (4, 4))(at, bt; ndrange=(4, 8)); CUDA.synchronize()
         @test Array(at) == permutedims(bh)
         # 2-D matmul (non-square) — scalar accumulator over a for-loop
         ah = rand(Float32, 8, 4); bbh = rand(Float32, 4, 6)
-        am = CUDA.CuArray(ah); bm = CUDA.CuArray(bbh); om = CUDA.zeros(Float32, 8, 6)
-        _g_matmul!(GPUB(), (4, 2))(om, am, bm; ndrange=(8, 6)); CUDA.synchronize()
+        am = MLIRArray(CUDA.CuArray(ah)); bm = MLIRArray(CUDA.CuArray(bbh)); om = MLIRArray(CUDA.zeros(Float32, 8, 6))
+        _g_matmul!(backend, (4, 2))(om, am, bm; ndrange=(8, 6)); CUDA.synchronize()
         @test maximum(abs.(Array(om) .- ah * bbh)) < 1f-3
 
         # @localmem cross-lane reverse + atomic-on-shared block reduction
         Nl = 1024; Wl = 256; NBl = Nl ÷ Wl
-        inl = CUDA.CuArray(rand(Float32, Nl)); ihl = Array(inl)
-        orl = CUDA.zeros(Float32, Nl)
-        _g_shrev!(GPUB(), Wl)(orl, inl; ndrange=Nl); CUDA.synchronize()
+        inl = MLIRArray(CUDA.CuArray(rand(Float32, Nl))); ihl = Array(inl)
+        orl = MLIRArray(CUDA.zeros(Float32, Nl))
+        _g_shrev!(backend, Wl)(orl, inl; ndrange=Nl); CUDA.synchronize()
         refrev = similar(ihl)
         for b in 0:(NBl-1), k in 1:Wl; refrev[b*Wl+k] = ihl[b*Wl + (Wl-k+1)]; end
         @test Array(orl) == refrev                       # cross-lane shared + barrier
-        osum = CUDA.zeros(Float32, NBl)
-        _g_blocksum!(GPUB(), Wl)(osum, inl; ndrange=Nl); CUDA.synchronize()
+        osum = MLIRArray(CUDA.zeros(Float32, NBl))
+        _g_blocksum!(backend, Wl)(osum, inl; ndrange=Nl); CUDA.synchronize()
         refsum = [sum(ihl[(b*Wl+1):((b+1)*Wl)]) for b in 0:(NBl-1)]
         @test isapprox(Array(osum), refsum; rtol=1f-4)   # atomic-on-shared
 
         # full KA histogram
         Lh = 4096; NBINS = 256
         hin = rand(1:NBINS, Lh)
-        dhin = CUDA.CuArray(hin); dhout = CUDA.zeros(Int, NBINS)
-        _g_histogram!(GPUB(), (256,))(dhout, dhin; ndrange=Lh); CUDA.synchronize()
+        dhin = MLIRArray(CUDA.CuArray(hin)); dhout = MLIRArray(CUDA.zeros(Int, NBINS))
+        _g_histogram!(backend, (256,))(dhout, dhin; ndrange=Lh); CUDA.synchronize()
         hist_ref = zeros(Int, NBINS); for v in hin; hist_ref[v] += 1; end
         @test Array(dhout) == hist_ref                   # full KA histogram
 
         # @private scalar + array (with Val arg)
         Np = 64; Wp = 16
-        ap = CUDA.zeros(Int, Np)
-        _g_privrev!(GPUB(), Wp)(ap; ndrange=Np); CUDA.synchronize()
+        ap = MLIRArray(CUDA.zeros(Int, Np))
+        _g_privrev!(backend, Wp)(ap; ndrange=Np); CUDA.synchronize()
         @test Array(ap) == repeat(collect(Wp:-1:1), Np ÷ Wp)   # per-thread scalar
-        Mp = 4; inpp = CUDA.CuArray(collect(1:Np)); op = CUDA.zeros(Int, Np)
-        _g_privarr!(GPUB(), Wp)(op, inpp, Val(Mp); ndrange=Np); CUDA.synchronize()
+        Mp = 4; inpp = MLIRArray(CUDA.CuArray(collect(1:Np))); op = MLIRArray(CUDA.zeros(Int, Np))
+        _g_privarr!(backend, Wp)(op, inpp, Val(Mp); ndrange=Np); CUDA.synchronize()
         @test Array(op) == [i * sum(1:Mp) for i in 1:Np]       # per-thread array + Val arg
 
         # 2-D @localmem tile copy + cross-lane transpose
         Mt = 32
-        int = CUDA.CuArray(reshape(collect(Float32, 1:(Mt*Mt)), Mt, Mt)); iht = Array(int)
-        otc = CUDA.zeros(Float32, Mt, Mt)
-        _g_tilecopy!(GPUB(), (16,16))(otc, int; ndrange=(Mt,Mt)); CUDA.synchronize()
+        int = MLIRArray(CUDA.CuArray(reshape(collect(Float32, 1:(Mt*Mt)), Mt, Mt))); iht = Array(int)
+        otc = MLIRArray(CUDA.zeros(Float32, Mt, Mt))
+        _g_tilecopy!(backend, (16,16))(otc, int; ndrange=(Mt,Mt)); CUDA.synchronize()
         @test Array(otc) == iht                                # 2-D tile copy
-        ott = CUDA.zeros(Float32, Mt, Mt)
-        _g_tiletr!(GPUB(), (16,16))(ott, int; ndrange=(Mt,Mt)); CUDA.synchronize()
+        ott = MLIRArray(CUDA.zeros(Float32, Mt, Mt))
+        _g_tiletr!(backend, (16,16))(ott, int; ndrange=(Mt,Mt)); CUDA.synchronize()
         reft = copy(iht)
         for bi in 0:1, bj in 0:1, ai in 1:16, aj in 1:16
             reft[bi*16+ai, bj*16+aj] = iht[bi*16+aj, bj*16+ai]
@@ -233,72 +238,65 @@ end
 
         # @simd / @unroll reduction loops over a Val{M} bound
         Ns = 64; Ws = 16; Ms = 4
-        as = CUDA.CuArray(collect(1:Ns)); refs = [Array(as)[k]*sum(1:Ms) for k in 1:Ns]
-        os1 = CUDA.zeros(Int, Ns)
-        _g_simdsum!(GPUB(), Ws)(os1, as, Val(Ms); ndrange=Ns); CUDA.synchronize()
+        as = MLIRArray(CUDA.CuArray(collect(1:Ns))); refs = [Array(as)[k]*sum(1:Ms) for k in 1:Ns]
+        os1 = MLIRArray(CUDA.zeros(Int, Ns))
+        _g_simdsum!(backend, Ws)(os1, as, Val(Ms); ndrange=Ns); CUDA.synchronize()
         @test Array(os1) == refs                               # @simd
-        os2 = CUDA.zeros(Int, Ns)
-        _g_unrollsum!(GPUB(), Ws)(os2, as, Val(Ms); ndrange=Ns); CUDA.synchronize()
+        os2 = MLIRArray(CUDA.zeros(Int, Ns))
+        _g_unrollsum!(backend, Ws)(os2, as, Val(Ms); ndrange=Ns); CUDA.synchronize()
         @test Array(os2) == refs                               # @unroll
 
         # code_gpu reflection: every codegen level emits its expected IR.
-        ar = CUDA.rand(Float32, 256); br = CUDA.rand(Float32, 256); cr = CUDA.zeros(Float32, 256)
-        kr = _g_vadd!(GPUB(), 256)
+        ar = MLIRArray(CUDA.rand(Float32, 256)); br = MLIRArray(CUDA.rand(Float32, 256))
+        cr = MLIRArray(CUDA.zeros(Float32, 256))
+        kr = _g_vadd!(backend, 256)
         @test occursin("gpu.func",        code_gpu(kr, cr, ar, br; ndrange=256, level=:mlir))
         @test occursin("llvm.",           code_gpu(kr, cr, ar, br; ndrange=256, level=:lowered))
         @test occursin("ptx_kernel",      code_gpu(kr, cr, ar, br; ndrange=256, level=:llvm))
         @test occursin(".visible .entry", code_gpu(kr, cr, ar, br; ndrange=256, level=:ptx))
 
-        # tiled matmul + MLIRArray wrapper auto-dispatch
+        # tiled matmul
         for nm in (256, 512)
-            Am = CUDA.rand(Float32, nm, nm); Bm = CUDA.rand(Float32, nm, nm)
-            Cm = CUDA.zeros(Float32, nm, nm)
-            _g_mmtiled!(GPUB(), (16, 16))(Cm, Am, Bm; ndrange=(nm, nm)); CUDA.synchronize()
+            Am = MLIRArray(CUDA.rand(Float32, nm, nm)); Bm = MLIRArray(CUDA.rand(Float32, nm, nm))
+            Cm = MLIRArray(CUDA.zeros(Float32, nm, nm))
+            _g_mmtiled!(backend, (16, 16))(Cm, Am, Bm; ndrange=(nm, nm)); CUDA.synchronize()
             @test isapprox(Array(Cm), Array(Am) * Array(Bm); rtol=1f-2)  # tiled matmul
         end
-        # MLIRArray: get_backend dispatches to MLIRCUDABackend, so a KA @kernel
-        # runs with no explicit backend — the path GPUArrays / AcceleratedKernels take.
-        wa = MLIRArray(CUDA.rand(Float32, 1024)); wb = MLIRArray(CUDA.rand(Float32, 1024))
-        wc = MLIRArray(CUDA.zeros(Float32, 1024))
-        @test KernelAbstractions.get_backend(wa) isa GPUB
-        _g_vadd!(KernelAbstractions.get_backend(wa), 256)(wc, wa, wb; ndrange=1024)
-        CUDA.synchronize()
-        @test Array(wc) ≈ Array(wa) .+ Array(wb)               # wrapper auto-dispatch
 
         # Closure kernel args (the map/reduce pattern): a closure capturing 1 or
         # 2 device arrays, flattened into memref params; the call inlines.
-        csrc = CUDA.CuArray(collect(Float32, 1:1024))
+        csrc = MLIRArray(CUDA.CuArray(collect(Float32, 1:1024)))
         cg = let s = csrc; i -> 2f0 * s[i]; end
-        cout = CUDA.zeros(Float32, 1024)
-        _g_applyclos!(GPUB(), 256)(cout, cg; ndrange=1024); CUDA.synchronize()
+        cout = MLIRArray(CUDA.zeros(Float32, 1024))
+        _g_applyclos!(backend, 256)(cout, cg; ndrange=1024); CUDA.synchronize()
         @test Array(cout) ≈ 2f0 .* (1:1024)                    # 1-capture closure
-        cdst = CUDA.zeros(Float32, 1024); csrc2 = CUDA.CuArray(collect(Float32, 1:1024))
+        cdst = MLIRArray(CUDA.zeros(Float32, 1024)); csrc2 = MLIRArray(CUDA.CuArray(collect(Float32, 1:1024)))
         ch = let d = cdst, s = csrc2; i -> (@inbounds d[i] = 3f0 * s[i]); end
-        _g_mapclos!(GPUB(), 256)(1024, ch; ndrange=1024); CUDA.synchronize()
+        _g_mapclos!(backend, 256)(1024, ch; ndrange=1024); CUDA.synchronize()
         @test Array(cdst) ≈ 3f0 .* (1:1024)                    # 2-capture closure + write
 
         # @index(Global, Cartesian): full-index A[I] (2-D + 1-D) + component I[k].
-        cda = CUDA.CuArray(rand(Float32, 16, 16)); cda0 = Array(cda)
-        _g_cartdbl!(GPUB(), (4, 4))(cda; ndrange=size(cda)); CUDA.synchronize()
+        cda = MLIRArray(CUDA.CuArray(rand(Float32, 16, 16))); cda0 = Array(cda)
+        _g_cartdbl!(backend, (4, 4))(cda; ndrange=size(cda)); CUDA.synchronize()
         @test Array(cda) ≈ 2f0 .* cda0                         # 2-D Cartesian A[I]
-        cv = CUDA.CuArray(rand(Float32, 1024)); cv0 = Array(cv)
-        _g_cartdbl!(GPUB(), 256)(cv; ndrange=length(cv)); CUDA.synchronize()
+        cv = MLIRArray(CUDA.CuArray(rand(Float32, 1024))); cv0 = Array(cv)
+        _g_cartdbl!(backend, 256)(cv; ndrange=length(cv)); CUDA.synchronize()
         @test Array(cv) ≈ 2f0 .* cv0                           # 1-D Cartesian
-        cta = CUDA.CuArray(rand(Float32, 8, 12)); ctb = CUDA.zeros(Float32, 12, 8)
-        _g_carttr!(GPUB(), (4, 4))(ctb, cta; ndrange=size(cta)); CUDA.synchronize()
+        cta = MLIRArray(CUDA.CuArray(rand(Float32, 8, 12))); ctb = MLIRArray(CUDA.zeros(Float32, 12, 8))
+        _g_carttr!(backend, (4, 4))(ctb, cta; ndrange=size(cta)); CUDA.synchronize()
         @test Array(ctb) == permutedims(Array(cta))            # Cartesian I[k] transpose
 
         # Tail-block masking: ndrange NOT a multiple of the workgroup. The grid
         # is padded (cld) and __validindex masks the out-of-range tail threads
         # (a tail thread that wrote would index out of bounds).
         for Nt in (1000, 257)
-            ta = CUDA.CuArray(rand(Float32, Nt)); tb = CUDA.CuArray(rand(Float32, Nt))
-            tc = CUDA.zeros(Float32, Nt)
-            _g_vadd!(GPUB(), 256)(tc, ta, tb; ndrange=Nt); CUDA.synchronize()
+            ta = MLIRArray(CUDA.CuArray(rand(Float32, Nt))); tb = MLIRArray(CUDA.CuArray(rand(Float32, Nt)))
+            tc = MLIRArray(CUDA.zeros(Float32, Nt))
+            _g_vadd!(backend, 256)(tc, ta, tb; ndrange=Nt); CUDA.synchronize()
             @test Array(tc) == Array(ta) .+ Array(tb)          # 1-D masked tail
         end
-        mta = CUDA.CuArray(rand(Float32, 100, 70)); mta0 = Array(mta)
-        _g_cartdbl!(GPUB(), (16, 16))(mta; ndrange=size(mta)); CUDA.synchronize()
+        mta = MLIRArray(CUDA.CuArray(rand(Float32, 100, 70))); mta0 = Array(mta)
+        _g_cartdbl!(backend, (16, 16))(mta; ndrange=size(mta)); CUDA.synchronize()
         @test Array(mta) ≈ 2f0 .* mta0                         # 2-D masked tail
     end
 end

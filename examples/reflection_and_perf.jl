@@ -3,6 +3,7 @@ using MLIRKernels, KernelAbstractions, CUDA, LLVM, Atomix, Printf
 const KA = KernelAbstractions
 const ext = Base.get_extension(MLIRKernels, :MLIRCUDAExt)
 const MLIRB = ext.MLIRCUDABackend
+const MLIRArray = ext.MLIRArray
 
 @assert CUDA.functional()
 
@@ -24,8 +25,10 @@ end
 # ---- reflection: print each codegen level for vadd -------------------------
 function show_levels()
     N = 1024
-    a = CUDA.rand(Float32, N); b = CUDA.rand(Float32, N); c = CUDA.zeros(Float32, N)
-    k = vadd!(MLIRB(), 256)
+    # Inputs are MLIRArrays, so the backend is inferred from the data.
+    a = MLIRArray(CUDA.rand(Float32, N)); b = MLIRArray(CUDA.rand(Float32, N))
+    c = MLIRArray(CUDA.zeros(Float32, N))
+    k = vadd!(get_backend(a), 256)
     for (lvl, head, nlines) in (
             (:sci,     "1. StructuredIRCode (post-inference Julia IR)", 45),
             (:mlir,    "2. High-level `gpu`-dialect MLIR (pre-pipeline)", 250),

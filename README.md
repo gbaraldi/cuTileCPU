@@ -2,7 +2,7 @@
 
 An MLIR-based kernel compiler for Julia. It infers a plain-Julia kernel through
 a standalone frontend (its own `AbstractInterpreter` +
-[IRStructurizer](https://github.com/JuliaLLVM/IRStructurizer.jl), no external
+[IRStructurizer](https://github.com/maleadt/IRStructurizer.jl), no external
 kernel DSL), lowers the result to high-level MLIR
 (`scf`/`arith`/`memref`/`vector`/`math`/`func`/`gpu`) **in-process via
 [MLIR.jl](https://github.com/JuliaLLVM/MLIR.jl)**, and emits code for two
@@ -23,7 +23,7 @@ available for the CPU path.
 
 ```julia
 using KernelAbstractions, CUDA, MLIRKernels
-const GPU = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRCUDABackend
+const MLIRArray = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRArray
 
 @kernel function vadd!(c, @Const(a), @Const(b))
     i = @index(Global, Linear)
@@ -31,17 +31,28 @@ const GPU = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRCUDABackend
 end
 
 n = 1 << 20
-a = CUDA.rand(Float32, n); b = CUDA.rand(Float32, n); c = CUDA.zeros(Float32, n)
-vadd!(GPU(), 256)(c, a, b; ndrange=n)          # workgroupsize 256
+# Wrap device arrays in MLIRArray; the backend is then inferred from the data,
+# so no backend type is named at the call site.
+a = MLIRArray(CUDA.rand(Float32, n))
+b = MLIRArray(CUDA.rand(Float32, n))
+c = MLIRArray(CUDA.zeros(Float32, n))
+vadd!(get_backend(a), 256)(c, a, b; ndrange=n)     # backend from data, workgroupsize 256
 CUDA.synchronize()
 @assert Array(c) ≈ Array(a) .+ Array(b)
 ```
 
-The GPU backend supports N-D `@index(Global/Local/Group, Linear|NTuple)`, N-D
-array indexing, `@localmem`/`@private`/`@synchronize`, `@Const`, `@groupsize`,
-`@atomic` (via Atomix), `@simd`/`@unroll`, and scalar reduction loops. `ndrange`
-must currently be an exact per-dim multiple of the workgroupsize (no tail-block
-masking yet).
+`MLIRArray` is the backend's array type — a thin wrapper around a `CuArray` whose
+`get_backend` returns `MLIRCUDABackend`. Because the backend is derived from the
+data (not hardcoded), backend-agnostic KA code dispatches here automatically:
+AcceleratedKernels' `map!`/`reduce` and similar run unmodified on `MLIRArray`
+inputs. `KernelAbstractions.allocate`/`zeros`/`ones` on the backend return
+`MLIRArray`s too.
+
+The GPU backend supports N-D `@index(Global/Local/Group, Linear|NTuple|Cartesian)`,
+N-D array indexing, `@localmem`/`@private`/`@synchronize`, `@Const`, `@groupsize`,
+`@atomic` (via Atomix), `@simd`/`@unroll`, scalar reduction loops, and tail-block
+masking — `ndrange` need not be a multiple of the workgroupsize (the grid is
+padded and out-of-range threads are masked).
 
 ### CPU (SPMD)
 
@@ -70,7 +81,7 @@ Inspect the emitted IR at any level without launching:
 
 ```julia
 # GPU SIMT path — :sci, :mlir, :lowered, :llvm, :ptx
-println(code_gpu(vadd!(GPU(), 256), c, a, b; ndrange=n, level=:ptx))
+println(code_gpu(vadd!(get_backend(a), 256), c, a, b; ndrange=n, level=:ptx))
 
 # CPU SPMD path
 println(code_mlir(vadd_spmd, (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int)))
@@ -169,8 +180,8 @@ code_mlir_lowered(f, argtypes; …)                     → String   # CPU, post
 code_llvm(f, argtypes; …)                             → String   # CPU LLVM IR
 code_gpu(kernel, args…; ndrange, level=:ptx)          → String   # GPU, any level
 
-# GPU launch is the KernelAbstractions surface:
-#   kernel(MLIRCUDABackend(), workgroupsize)(args…; ndrange)
+# GPU launch is the KernelAbstractions surface; the backend comes from the data:
+#   kernel(get_backend(mlirarray), workgroupsize)(args…; ndrange)
 ```
 
 ## Module layout
@@ -189,7 +200,7 @@ MLIRKernels/
 │   ├── KernelAbstractionsExt.jl  ← MLIRBackend (CPU) + KA intrinsic overlays
 │   └── MLIRCUDAExt.jl            ← MLIRCUDABackend (GPU) + launch + code_gpu
 ├── examples/                 ← reflection_and_perf.jl, tiled_matmul.jl
-└── test/                     ← ParallelTestRunner driver + test_{spmd,ka_cpu,ka_upstream,gpu_simt}.jl
+└── test/                     ← ParallelTestRunner driver + test_{spmd,ka_cpu,ka_upstream,downstream_ka,gpu_simt}.jl
 ```
 
 ## Tests
@@ -202,8 +213,10 @@ Run with [ParallelTestRunner.jl](https://github.com/JuliaTesting/ParallelTestRun
 ```
 
 `test_ka_upstream.jl` runs KernelAbstractions' own canonical testsuite kernels
-(localmem, private, index, copyto!, unroll) verbatim on the GPU backend. The
-GPU/KA testsets self-skip when CUDA isn't functional.
+(localmem, private, index, copyto!, unroll) verbatim on the GPU backend, and
+`test_downstream_ka.jl` runs AcceleratedKernels' `map!`/`reduce` on `MLIRArray`
+inputs — both via the `get_backend` auto-dispatch path, with no backend named.
+The GPU/KA testsets self-skip when CUDA isn't functional.
 
 ## Dependencies
 
