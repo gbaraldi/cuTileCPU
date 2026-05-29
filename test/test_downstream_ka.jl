@@ -7,6 +7,16 @@ using CUDA, LLVM, KernelAbstractions, Atomix, AcceleratedKernels
 const AK = AcceleratedKernels
 const MLIRArray = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRArray
 
+# foreachindex's loop-body closure must be defined inside a function so it
+# captures `dst`/`src` as typed fields (a top-level closure capturing globals is
+# type-unstable — AK rejects that on GPU). The captured MLIRArrays flatten +
+# `_host_argtype`-remap to host Array, so the `f(indices[i])` call inlines.
+function _ak_foreach_double!(dst, src)
+    AK.foreachindex(src) do i
+        @inbounds dst[i] = 2f0 * src[i]
+    end
+end
+
 @testset "AcceleratedKernels on MLIRCUDABackend" begin
     if !CUDA.functional()
         @info "CUDA not functional — skipping AcceleratedKernels test"
@@ -40,5 +50,11 @@ const MLIRArray = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRArray
         AK.accumulate!(+, adst, rsrc; init=0f0); CUDA.synchronize()
         @test Array(adst) ≈ cumsum(1:n)                   # AK.accumulate! end-to-end
         @test Array(AK.cumsum(rsrc)) ≈ cumsum(1:n)        # AK.cumsum end-to-end
+
+        # foreachindex: grid over indices, user loop-body closure (unsafe_indices
+        # kernel + indirect `f(indices[i])` that inlines via the capture remap).
+        fdst = MLIRArray(CUDA.zeros(Float32, n))
+        _ak_foreach_double!(fdst, rsrc); CUDA.synchronize()
+        @test Array(fdst) ≈ 2f0 .* (1:n)                  # AK.foreachindex end-to-end
     end
 end
