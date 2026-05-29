@@ -33,31 +33,11 @@ const _gpu    = Dialects.gpu
 # Lowering context
 # ----------------------------------------------------------------------------
 
-# A partition view = a memref + per-block tile shape (+ elem type).
-# When a load happens at index (%bid_1, …, %bid_N), the memref offset along
-# axis k is `%bid_k * tile_shape[k]`. We carry the source memref + tile shape
-# + element type so load/store sites can synthesize offsets + correct vector
-# types.
-struct PartitionInfo
-    base::IR.Value
-    tile_shape::Vector{Int}   # Julia (col-major) order
-    elem_type::Type
-end
-
-# A tensor view = (ptr, sizes, strides) from an array, plus the
-# element type. Tracked-only (no IR emitted) — the downstream partition_view
-# reads `.base` (memref Value) and `.elem_type` to build PartitionInfo.
-struct TensorViewInfo
-    base::IR.Value
-    elem_type::Type
-end
-
-# An "offset view" produced by `Intrinsics.offset(ptr_tile, indices_tile)`.
-# Tracked-only — consumed by `Intrinsics.load_ptr_tko` (gather) and
-# `Intrinsics.store_ptr_tko` (scatter). `base` is the source memref (resolved
-# via the ptr field-ref), `indices` is the per-lane i32 (or iK) index vector,
-# `elem_type` is the source element type, and `idx_shape` is the tile shape
-# of the indices (Julia col-major).
+# An "offset view": a source memref + per-lane index vector, produced when a
+# varying (lane-vector) index reaches `memoryrefnew`. Tracked-only — consumed by
+# the SPMD `memoryrefget`/`memoryrefset!` gather/scatter path. `base` is the
+# source memref, `indices` the per-lane index vector, `elem_type` the source
+# element type, and `idx_shape` the index tile shape (Julia col-major).
 struct OffsetInfo
     base::IR.Value
     indices::IR.Value
@@ -77,8 +57,6 @@ mutable struct LowerCtx
     # Multi-result control-flow ops (IfOp / ForOp results): SSA → [Value...].
     ssa_multi::Dict{Int, Vector{IR.Value}}
     # Tracked, no IR emitted:
-    tensor_views::Dict{Int, TensorViewInfo}
-    partitions::Dict{Int, PartitionInfo}
     offsets::Dict{Int, OffsetInfo}             # SSA → gather/scatter pointer-tile
     field_refs::Dict{Int, Tuple{Int, Symbol}}  # SSA → (arg id, fieldname)
     tuples::Dict{Int, Vector{Any}}             # SSA → component refs
@@ -88,14 +66,6 @@ mutable struct LowerCtx
     arg_elem_types::Dict{Int, Type}
     # Grid bid Values, one per grid dim, x/y/z order.
     bids::Vector{IR.Value}
-    # Grid extents, one per grid dim. Each is an i32 Value (already
-    # `index_cast` from the `index`-typed grid param).
-    grid_extents_i32::Vector{IR.Value}
-    # SSAs that resolve to `KernelState` (from `Intrinsics.kernel_state()`).
-    # `getfield(_, :seed)` on these returns `seed_param` below.
-    kernel_state_ssas::Set{Int}
-    # MLIR Value of the i32 `KernelState.seed` parameter, bound at func entry.
-    seed_param::Union{Nothing, IR.Value}
     # ----- SPMD ("ISPC-style" scalar-typed kernels) mode -----
     # When true, the walker accepts plain Julia scalar code (Vector{T} args
     # + scalar lane index) and lifts each scalar op to a `lane_width`-wide
@@ -136,13 +106,11 @@ LowerCtx(ctx, mod) = LowerCtx(
     ctx, mod,
     Dict{Int, IR.Value}(), Dict{Int, IR.Value}(), Dict{Int, Any}(),
     Dict{Int, IR.Value}(), Dict{Int, Vector{IR.Value}}(),
-    Dict{Int, TensorViewInfo}(), Dict{Int, PartitionInfo}(),
     Dict{Int, OffsetInfo}(),
     Dict{Int, Tuple{Int, Symbol}}(), Dict{Int, Vector{Any}}(),
     Dict{Int, Symbol}(),
     Dict{Int, Type}(),
-    IR.Value[], IR.Value[],
-    Set{Int}(), nothing,
+    IR.Value[],
     false, 16, 0, Int64,
     Int[], Int[],
     Dict{Int, Tuple{IR.Value, Type, Vector{Int}}}(), nothing)
@@ -1098,130 +1066,7 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
                     args::Vector{Any}, @nospecialize(typ))
     fname = callee_name(callee)
 
-    if fname === :kernel_state
-        # `Intrinsics.kernel_state()` returns the host-supplied `KernelState`
-        # struct (single `seed::UInt32` field). We tag the SSA so the immediate
-        # `getfield(_, :seed)` resolves to the seed param bound at func entry.
-        # No IR is emitted for the intrinsic itself.
-        push!(lc.kernel_state_ssas, idx)
-        return nothing
-
-    elseif fname === :get_tile_block_id
-        axis = something(resolve_const(lc, args[1]), args[1])
-        axis isa Integer ||
-            error("get_tile_block_id: axis must be const, got $(args[1])")
-        ax = Int(axis)
-        i32_t = IR.Type(Int32)
-        # `rng_key` reads axes 0..2 unconditionally even on a 1-D grid —
-        # beyond the actual grid the device-side semantics yield 0.
-        # Return constant Int32(0) for axes beyond our runtime grid rank.
-        if ax + 1 > length(lc.bids)
-            return IR.result(_arith.constant(; value=IR.Attribute(Int32(0))))
-        end
-        # bid is `index` in MLIR but the intrinsic is typed Int32. Cast so
-        # subsequent arithmetic (addi/cmpi/exti) sees a matching i32 type.
-        # Tile-load index ops re-cast back via `cast_to_index`.
-        bid_idx = lc.bids[ax + 1]
-        return IR.result(_arith.index_cast(bid_idx; out=i32_t))
-
-    elseif fname === :addf
-        return emit_binop_value!(lc, args, _arith.addf)
-
-    elseif fname === :subf
-        return emit_binop_value!(lc, args, _arith.subf)
-
-    elseif fname === :mulf
-        return emit_binop_value!(lc, args, _arith.mulf)
-
-    elseif fname === :divf
-        return emit_binop_value!(lc, args, _arith.divf)
-
-    elseif fname === :exp
-        return emit_unary_math!(lc, args, _math.exp, typ)
-
-    elseif fname === :rsqrt
-        return emit_unary_math!(lc, args, _math.rsqrt, typ)
-
-    elseif fname === :sqrt
-        return emit_unary_math!(lc, args, _math.sqrt, typ)
-
-    elseif fname === :exp2
-        return emit_unary_math!(lc, args, _math.exp2, typ)
-
-    elseif fname === :log
-        return emit_unary_math!(lc, args, _math.log, typ)
-
-    elseif fname === :log2
-        return emit_unary_math!(lc, args, _math.log2, typ)
-
-    elseif fname === :sin
-        return emit_unary_math!(lc, args, _math.sin, typ)
-
-    elseif fname === :cos
-        return emit_unary_math!(lc, args, _math.cos, typ)
-
-    elseif fname === :tan
-        return emit_unary_math!(lc, args, _math.tan, typ)
-
-    elseif fname === :tanh
-        return emit_unary_math!(lc, args, _math.tanh, typ)
-
-    elseif fname === :sinh
-        return emit_unary_math!(lc, args, _math.sinh, typ)
-
-    elseif fname === :cosh
-        return emit_unary_math!(lc, args, _math.cosh, typ)
-
-    elseif fname === :floor
-        return emit_unary_math!(lc, args, _math.floor, typ)
-
-    elseif fname === :ceil
-        return emit_unary_math!(lc, args, _math.ceil, typ)
-
-    elseif fname === :absf
-        return emit_unary_math!(lc, args, _math.absf, typ)
-
-    elseif fname === :absi
-        return emit_unary_math!(lc, args, _math.absi, typ)
-
-    elseif fname === :maxf
-        # Intrinsics.maxf(a, b) — element-wise floating-point max. Same vector
-        # shape on both operands. Lowers to arith.maxnumf (NaN-quieting form,
-        # matches Base.max semantics).
-        return emit_binop_value!(lc, args, _arith.maxnumf)
-
-    elseif fname === :minf
-        return emit_binop_value!(lc, args, _arith.minnumf)
-
-    elseif fname === :addi
-        return emit_binop_value!(lc, args, _arith.addi)
-
-    elseif fname === :subi
-        return emit_binop_value!(lc, args, _arith.subi)
-
-    elseif fname === :muli
-        return emit_binop_value!(lc, args, _arith.muli)
-
-    elseif fname === :xori
-        return emit_binop_value!(lc, args, _arith.xori)
-
-    elseif fname === :ori
-        return emit_binop_value!(lc, args, _arith.ori)
-
-    elseif fname === :andi
-        return emit_binop_value!(lc, args, _arith.andi)
-
-    elseif fname === :shli
-        # Intrinsics.shli(a, b) — logical left shift.
-        return emit_binop_value!(lc, args, _arith.shli)
-
-    elseif fname === :cmpi
-        return emit_cmpi!(lc, args, typ)
-
-    elseif fname === :cmpf
-        return emit_cmpf!(lc, args, typ)
-
-    elseif fname === :tuple
+    if fname === :tuple
         lc.tuples[idx] = collect(args)
         return nothing
 
@@ -1828,21 +1673,6 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
             end
             return nothing
         end
-        # KernelState-rooted: `getfield(kernel_state_ssa, :seed)` → seed param.
-        if obj.id in lc.kernel_state_ssas
-            fld_sym = if args[2] isa QuoteNode
-                args[2].value
-            elseif args[2] isa Symbol
-                args[2]
-            else
-                error("getfield(KernelState, ...): field must be Symbol/QuoteNode, got $(args[2])")
-            end
-            fld_sym === :seed ||
-                error("getfield(KernelState, ...): only :seed is supported, got :$fld_sym")
-            lc.seed_param === nothing &&
-                error("getfield(KernelState, :seed): seed parameter not bound")
-            return lc.seed_param
-        end
         k = something(resolve_const(lc, args[2]), args[2])
         k isa Integer || error("getfield: SSA-rooted index must be const int, got $(args[2])")
         ki = Int(k)
@@ -2377,20 +2207,6 @@ end
 # then lower to `vector.gather`/`vector.scatter` on the array's memref.
 # Indices arriving here are 1-based (Julia semantics); on plain Julia code
 # we get the raw 1-based index — we subtract 1 below.
-
-# Detect contiguous lane indices. The SPMD lane vector is constructed as
-# `splat(bid * W) + step(0..W-1)` — an affine, contiguous pattern. The
-# fast path: convert to a `vector.transfer_read` / `vector.transfer_write`
-# with the (scalar) base offset; falls back to gather/scatter otherwise.
-# For the MVP we detect the contiguous case purely by checking whether the
-# index vector equals `lc.arg_vals[lane_arg]` — i.e. the user's `%i` is the
-# lane arg directly (the common `a[i]` case). Anything else (computed
-# offsets, gather-style indirection) falls back to gather/scatter.
-function _is_contiguous_lane_index(lc::LowerCtx, indices::IR.Value)
-    lc.spmd || return false
-    haskey(lc.arg_vals, lc.lane_arg) || return false
-    return indices == lc.arg_vals[lc.lane_arg]
-end
 
 # Recover the scalar `lane_base` (`bid * lane_width`) for a contiguous-lane
 # transfer_read/write. Encoded once when the lane vector is built; here we
