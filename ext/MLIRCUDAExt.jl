@@ -163,6 +163,7 @@ const GPU_PASSES = String[
     "gpu-kernel-outlining",
     "gpu.module(convert-gpu-to-nvvm)",
     "convert-scf-to-cf", "convert-cf-to-llvm", "convert-arith-to-llvm",
+    "convert-vector-to-llvm",   # struct-as-vector<N×T> element: extract/insert/load
     "expand-strided-metadata", "finalize-memref-to-llvm",
     "convert-nvvm-to-llvm", "reconcile-unrealized-casts",
     "gpu-module-to-binary{format=llvm}",

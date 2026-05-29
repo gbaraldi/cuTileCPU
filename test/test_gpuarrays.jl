@@ -74,9 +74,9 @@ mk(v) = MLIRArray(CUDA.CuArray(v))
         @test A(vcat(a, b)) == vcat(A(a), A(b))                   # vcat
         let m = mk(rand(Float32, 16, 4)); @test A(hcat(m, m)) == hcat(A(m), A(m)); end
 
-        # Base reductions → GPUArrays.mapreducedim! → our single-workgroup
-        # grid-stride reduce kernel (@localmem tree reduce). `count`/`any`/`all`
-        # exercise the Bool→Int width coercion; max/min the new maxnumf/minnumf.
+        # Base reductions → GPUArrays.mapreducedim! → AcceleratedKernels' reduce.
+        # `count`/`any`/`all` exercise the Bool→Int width coercion + the explicit
+        # result-type neutral; max/min the new maxnumf/minnumf.
         @test sum(a) ≈ sum(A(a))
         @test maximum(a) == maximum(A(a))
         @test minimum(a) == minimum(A(a))
@@ -86,5 +86,37 @@ mk(v) = MLIRArray(CUDA.CuArray(v))
         @test any(>(0.5f0), a) == any(>(0.5f0), A(a))
         @test all(>(0.0f0), p)
         @test mapreduce(abs2, +, a) ≈ mapreduce(abs2, +, A(a))
+    end
+end
+
+# Homogeneous bits-structs (all fields one scalar type) lower as `vector<N×T>`,
+# matching array-of-structs layout: load→destructure, getfield→extractelement,
+# `:new`→from_elements, store→vector. Covers Complex + a custom struct.
+struct P2; x::Float32; y::Float32; end
+Base.:+(a::P2, b::P2) = P2(a.x + b.x, a.y + b.y)
+Base.zero(::Type{P2}) = P2(0.0f0, 0.0f0)
+
+@testset "struct/Complex element types on MLIRCUDABackend" begin
+    if !CUDA.functional()
+        @test true
+    else
+        n = 512; A = Array
+        a = mk(rand(ComplexF32, n)); b = mk(rand(ComplexF32, n))
+        @test A(a .+ b) ≈ A(a) .+ A(b)
+        @test A(a .* b) ≈ A(a) .* A(b)           # complex mul: re/im cross terms
+        @test A(abs.(a)) ≈ abs.(A(a))
+        @test A(real.(a)) ≈ real.(A(a))
+        @test A(conj.(a)) ≈ conj.(A(a))
+        @test sum(a) ≈ sum(A(a))                 # reduction over a struct element
+        @test A(mk(rand(ComplexF64, n)) .+ mk(rand(ComplexF64, n))) isa Vector{ComplexF64}
+
+        # custom homogeneous struct (P2 = 2×Float32) — not `<: Number`.
+        ps = mk([P2(Float32(i), Float32(2i)) for i in 1:n])
+        qs = mk([P2(1.0f0, 1.0f0) for _ in 1:n])
+        r = A(ps .+ qs)
+        @test r[3] == P2(4.0f0, 7.0f0)
+        d = mk([P2(0.0f0, 0.0f0) for _ in 1:n])
+        map!(p -> P2(2p.x, 2p.y), d, ps); CUDA.synchronize()
+        @test A(d)[5] == P2(10.0f0, 20.0f0)
     end
 end

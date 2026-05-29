@@ -126,6 +126,11 @@ mutable struct LowerCtx
     # SSA → an Argument/SSAValue it transparently aliases (e.g. the array a
     # `getfield(Const, :a)` yields). Resolved at the top of getfield/resolve.
     aliases::Dict{Int, Any}
+    # SSA → homogeneous-struct Julia type, for values represented as a
+    # `vector<Nfields×T>` (loaded from a struct array / yielded from an scf.if).
+    # `getfield(v, field)` on these extracts the lane; tagged by SCI type in the
+    # walk. (Heterogeneous structs are a future, separate representation.)
+    struct_vals::Dict{Int, Type}
 end
 
 LowerCtx(ctx, mod) = LowerCtx(
@@ -142,13 +147,31 @@ LowerCtx(ctx, mod) = LowerCtx(
     Dict{Int, Tuple{IR.Value, Type, Vector{Int}}}(), nothing,
     Dict{Tuple{Int, Tuple}, Tuple{Int, Symbol}}(), Set{Int}(),
     Dict{Int, Tuple{Int, Tuple}}(), Dict{Int, Int}(),
-    Dict{Int, Tuple{Any, Vector{Any}}}(), Dict{Int, Any}())
+    Dict{Int, Tuple{Any, Vector{Any}}}(), Dict{Int, Any}(),
+    Dict{Int, Type}())
 
 # ----------------------------------------------------------------------------
 # Type translation: Julia → MLIR
 # ----------------------------------------------------------------------------
 
+# A homogeneous bits-struct (all fields the same scalar type, e.g. `ComplexF32` =
+# 2×Float32, `Point{Float32}` = 3×Float32) maps to `vector<Nfields × fieldtype>`,
+# which matches its array-of-structs memory layout. Returns (nfields, fieldtype)
+# or `nothing`. Excludes structs whose field isn't a scalar (e.g. `CartesianIndex`,
+# whose single field is an NTuple — kept on the transient `new_structs` path).
+function _struct_vec_info(@nospecialize(T))
+    (T isa DataType && isconcretetype(T) && isstructtype(T) && isbitstype(T)) || return nothing
+    fts = fieldtypes(T)
+    (isempty(fts) || any(ft -> ft !== fts[1], fts)) && return nothing
+    ft = fts[1]
+    (ft isa Type && ft <: Number && isbitstype(ft)) || return nothing
+    return (length(fts), ft)
+end
+
 function mlir_elem_type(T::Type)
+    let si = _struct_vec_info(T)
+        si === nothing || return IR.VectorType(1, Int[si[1]], mlir_elem_type(si[2]))
+    end
     T === Float32  && return IR.Type(Float32)
     T === Float64  && return IR.Type(Float64)
     T === Float16  && return IR.Type(Float16)
@@ -922,7 +945,12 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
             continue
         end
         v = walk_stmt!(lc, idx, stmt, typ)
-        v === nothing || (lc.ssa_vals[idx] = v)
+        if v !== nothing
+            lc.ssa_vals[idx] = v
+            # Tag homogeneous-struct values (a `vector<N×T>`) so `getfield`
+            # extracts the right lane; propagates through any op via its SCI type.
+            typ isa Type && _struct_vec_info(typ) !== nothing && (lc.struct_vals[idx] = typ)
+        end
     end
     # Terminator
     term = block.terminator
@@ -946,7 +974,7 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
                 # If the if-result type was promoted (numeric union), coerce this
                 # branch's yield to the common type so both branches agree.
                 if k <= length(yield_types) && yield_types[k] isa Type &&
-                   yield_types[k] <: Number
+                   yield_types[k] <: Number && _struct_vec_info(yield_types[k]) === nothing
                     resolved = _coerce_numeric!(resolved, yield_types[k])
                 end
                 push!(vals, resolved)
@@ -1153,6 +1181,20 @@ end
 function resolve_value_or_const(lc::LowerCtx, @nospecialize(op))
     v = resolve_value(lc, op)
     v === nothing || return v
+    # A homogeneous-struct `:new` used as a VALUE (yielded from scf.if, stored to
+    # an array, passed on): materialise its fields into `vector<N×T>`.
+    if op isa SSAValue && haskey(lc.new_structs, op.id)
+        (T, ops) = lc.new_structs[op.id]
+        if _struct_vec_info(T) !== nothing
+            elems = IR.Value[]
+            for o in ops
+                fv = resolve_value_or_const(lc, o)
+                fv === nothing && error("struct field unresolved: $o")
+                push!(elems, fv)
+            end
+            return IR.result(_vector.from_elements(elems; result=mlir_elem_type(T)))
+        end
+    end
     if op isa Bool
         return _const_value(op)
     elseif op isa Number
@@ -2108,6 +2150,18 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
         end
         return resolve_value_or_const(lc, operand)
     end
+    # `getfield(struct_value, :field)` where the value is a `vector<N×T>` (loaded
+    # from a struct array / scf.if result): extract the field's lane.
+    if obj isa SSAValue && haskey(lc.struct_vals, obj.id)
+        T = lc.struct_vals[obj.id]
+        vec = resolve_value_or_const(lc, obj)
+        vec === nothing && error("getfield: unresolved struct value $obj")
+        fld = args[2] isa QuoteNode ? args[2].value : args[2]
+        fi = fld isa Symbol ? Base.fieldindex(T, fld) : Int(fld)
+        pos = IR.result(_arith.constant(;
+                  value=IR.Attribute(fi - 1, IR.IndexType()), result=IR.IndexType()))
+        return IR.result(_vector.extractelement(vec, pos; result=eltype(IR.type(vec))))
+    end
     if obj isa Argument
         field = args[2]
         fld = field isa QuoteNode ? field.value :
@@ -2357,7 +2411,9 @@ function if_result_types(@nospecialize(typ))
             pt = reduce(promote_type, members)
             push!(jls, pt)
             push!(rts, mlir_elem_type(pt))
-        elseif p isa Type && p <: Number
+        elseif p isa Type && (p <: Number || _struct_vec_info(p) !== nothing)
+            # Scalar numeric OR a homogeneous-struct value (a `vector<N×T>`, e.g.
+            # a `Complex`/`Point` loaded from an array and yielded from a branch).
             push!(jls, p)
             push!(rts, mlir_elem_type(p))
         else
@@ -3166,6 +3222,7 @@ function emit_spmd_memoryrefset!(lc::LowerCtx, args, @nospecialize(typ))
     # into a narrower array. This is Julia's implicit `convert` at the store,
     # minus the overflow check we elide like other in-kernel throws.
     if off.elem_type isa Type && off.elem_type <: Number &&
+       _struct_vec_info(off.elem_type) === nothing &&
        IR.type(val_v) != _conv_out_type(val_v, off.elem_type)
         val_v = _coerce_numeric!(val_v, off.elem_type)
     end
