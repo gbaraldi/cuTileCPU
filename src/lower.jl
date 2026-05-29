@@ -109,7 +109,15 @@ mutable struct LowerCtx
     # maps the SSA of a `getfield(closure, :array_field)` to its synthetic slot,
     # so the result reuses the array-arg indexing path (its :ref/:size resolve
     # to the synthetic slot's memref).
-    captured::Dict{Tuple{Int, Symbol}, Tuple{Int, Symbol}}
+    # `captured` keys a flattened LEAF by (arg_slot, field_path) where field_path
+    # is a Tuple of fieldnames/tuple-indices from the arg down to the leaf
+    # (e.g. (:parent,) or (:indices, 1, :stop) for a SubArray). `flattened_slots`
+    # is the set of arg slots that were flattened; `field_paths` maps the SSA of a
+    # `getfield` reaching a NON-leaf (intermediate struct) to its (slot, path) so
+    # the next getfield extends the path.
+    captured::Dict{Tuple{Int, Tuple}, Tuple{Int, Symbol}}
+    flattened_slots::Set{Int}
+    field_paths::Dict{Int, Tuple{Int, Tuple}}
     array_ssa::Dict{Int, Int}
     # `Expr(:new, T, fields...)` struct construction (e.g. KA's `@Const` +
     # `inbounds=true` wraps a read-only array in `Base.Experimental.Const`):
@@ -132,7 +140,8 @@ LowerCtx(ctx, mod) = LowerCtx(
     false, 16, 0, Int64,
     Int[], Int[],
     Dict{Int, Tuple{IR.Value, Type, Vector{Int}}}(), nothing,
-    Dict{Tuple{Int, Symbol}, Tuple{Int, Symbol}}(), Dict{Int, Int}(),
+    Dict{Tuple{Int, Tuple}, Tuple{Int, Symbol}}(), Set{Int}(),
+    Dict{Int, Tuple{Int, Tuple}}(), Dict{Int, Int}(),
     Dict{Int, Tuple{Any, Vector{Any}}}(), Dict{Int, Any}())
 
 # ----------------------------------------------------------------------------
@@ -144,10 +153,14 @@ function mlir_elem_type(T::Type)
     T === Float64  && return IR.Type(Float64)
     T === Float16  && return IR.Type(Float16)
     T === BFloat16 && return IR.Type(BFloat16)
+    T === Int8     && return IR.Type(Int8)
+    T === Int16    && return IR.Type(Int16)
     T === Int32    && return IR.Type(Int32)
     T === Int64    && return IR.Type(Int64)
-    # MLIR uses signless integer types: UInt32/UInt64 map to the same i32/i64
-    # as their signed counterparts (signedness is a per-op attribute).
+    # MLIR uses signless integer types: unsigned ints map to the same iN as
+    # their signed counterparts (signedness is a per-op attribute).
+    T === UInt8    && return IR.Type(Int8)
+    T === UInt16   && return IR.Type(Int16)
     T === UInt32   && return IR.Type(Int32)
     T === UInt64   && return IR.Type(Int64)
     T === Bool     && return IR.Type(Bool)
@@ -695,12 +708,14 @@ end
 # leaves get params (for marshalling consistency) but aren't directly addressed.
 # Returns the updated synthetic-slot counter.
 function _flatten_struct_arg!(lc::LowerCtx, @nospecialize(T), arg_slot::Int,
-                              is_top::Bool, syn::Int, param_mlir_types,
+                              path::Tuple, syn::Int, param_mlir_types,
                               param_arg_slots, param_julia_types, param_kinds,
                               global_attr)
+    push!(lc.flattened_slots, arg_slot)
     for fn in fieldnames(T)
         FT = fieldtype(T, fn)
         Base.issingletontype(FT) && continue
+        leaf = (path..., fn)
         if FT <: DenseArray
             syn -= 1
             mrc = IR.MemRefType(mlir_elem_type(eltype(FT)),
@@ -709,14 +724,14 @@ function _flatten_struct_arg!(lc::LowerCtx, @nospecialize(T), arg_slot::Int,
             push!(param_mlir_types, mrc); push!(param_arg_slots, syn)
             push!(param_julia_types, FT); push!(param_kinds, :memref)
             lc.arg_elem_types[syn] = eltype(FT)
-            is_top && (lc.captured[(arg_slot, fn)] = (syn, :memref))
+            lc.captured[(arg_slot, leaf)] = (syn, :memref)
         elseif FT <: Number
             syn -= 1
             push!(param_mlir_types, mlir_elem_type(FT)); push!(param_arg_slots, syn)
             push!(param_julia_types, FT); push!(param_kinds, :scalar)
-            is_top && (lc.captured[(arg_slot, fn)] = (syn, :scalar))
+            lc.captured[(arg_slot, leaf)] = (syn, :scalar)
         elseif isstructtype(FT) && !isempty(fieldnames(FT))
-            syn = _flatten_struct_arg!(lc, FT, arg_slot, false, syn,
+            syn = _flatten_struct_arg!(lc, FT, arg_slot, leaf, syn,
                        param_mlir_types, param_arg_slots, param_julia_types,
                        param_kinds, global_attr)
         else
@@ -815,7 +830,7 @@ function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
                     # recursively flatten captured fields into their own params.
                     (isstructtype(AT_wide) && !isempty(fieldnames(AT_wide))) ||
                         error("MLIRKernels GPU: unsupported arg type $AT_wide at slot $i")
-                    syn_counter = _flatten_struct_arg!(lc, AT_wide, i, true,
+                    syn_counter = _flatten_struct_arg!(lc, AT_wide, i, (),
                         syn_counter, param_mlir_types, param_arg_slots,
                         param_julia_types, param_kinds, global_attr)
                 end
@@ -1729,6 +1744,24 @@ end
 # Handle Base.getfield in both Argument-rooted (an array view's
 # ptr/sizes/strides fields) and SSA-rooted (extract from a multi-result
 # control-flow op or a tracked tuple) forms.
+# Resolve a `getfield` on a flattened struct arg at (slot, path): a captured
+# leaf is a memref (route the result SSA through the array-arg indexing path) or
+# a scalar (return its Value); a non-leaf intermediate is recorded so the next
+# getfield extends the path.
+function _resolve_captured!(lc::LowerCtx, idx::Int, slot::Int, path::Tuple)
+    if haskey(lc.captured, (slot, path))
+        (syn, knd) = lc.captured[(slot, path)]
+        if knd === :memref
+            lc.array_ssa[idx] = syn
+            return nothing
+        else
+            return lc.arg_vals[syn]
+        end
+    end
+    lc.field_paths[idx] = (slot, path)
+    return nothing
+end
+
 function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
     obj = args[1]
     # Resolve through transparent aliases (e.g. the array that `getfield(Const,
@@ -1755,20 +1788,24 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
         fld_sym = field isa QuoteNode ? field.value :
                   field isa Symbol    ? field :
                   error("getfield: field must be Symbol/QuoteNode, got $field")
-        # Closure/functor capture: `getfield(closure_arg, :field)` for a field
-        # flattened into its own param at signature time.
-        if haskey(lc.captured, (obj.n, fld_sym))
-            (syn, knd) = lc.captured[(obj.n, fld_sym)]
-            if knd === :memref
-                lc.array_ssa[idx] = syn      # reuse the array-arg indexing path
-                return nothing
-            else                              # :scalar
-                return lc.arg_vals[syn]
-            end
+        # Flattened struct/closure/wrapped-array arg: resolve `getfield(arg, fld)`
+        # against the captured field-path tree.
+        if obj.n in lc.flattened_slots
+            return _resolve_captured!(lc, idx, obj.n, (fld_sym,))
         end
         lc.field_refs[idx] = (obj.n, fld_sym)
         return nothing
     elseif obj isa SSAValue
+        # A getfield reaching a non-leaf intermediate of a flattened arg
+        # (e.g. `subarray.indices` then `[1]` then `.stop`): extend the path.
+        if haskey(lc.field_paths, obj.id)
+            (slot, ppath) = lc.field_paths[obj.id]
+            f2 = args[2]
+            fld = f2 isa QuoteNode ? f2.value :
+                  (f2 isa Symbol || f2 isa Integer) ? f2 :
+                  something(resolve_const(lc, f2), f2)
+            return _resolve_captured!(lc, idx, slot, (ppath..., fld))
+        end
         # A captured-array field (the SSA of `getfield(closure, :arr)`): index it
         # exactly like the array arg at its synthetic slot — `:ref`/`:size` get
         # recorded in field_refs so memoryrefnew + memref.dim route to that slot.

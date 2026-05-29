@@ -18,5 +18,12 @@ const MLIRArray = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRArray
         AK.map!(x -> 2f0 * x, dst, src)        # dispatches to MLIRCUDABackend
         CUDA.synchronize()
         @test Array(dst) ≈ 2f0 .* (1:n)        # AK.map! end-to-end
+
+        # reduce: @Const(@view src[1:end]) wrapped array + @localmem block
+        # reduction + @synchronize. Exercises the recursive struct-flatten
+        # (SubArray.parent/offset/stride + .indices), the Const/:new wrapper, and
+        # the block-reduction helper.
+        rsrc = MLIRArray(CUDA.CuArray(collect(Float32, 1:n)))
+        @test AK.reduce(+, rsrc; init=0.0f0) ≈ sum(1:n)   # AK.reduce end-to-end
     end
 end
