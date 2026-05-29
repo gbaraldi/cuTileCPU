@@ -80,12 +80,15 @@ CPU through the `MLIRBackend` (in `KernelAbstractionsExt`).
 Inspect the emitted IR at any level without launching:
 
 ```julia
-# GPU SIMT path — :sci, :mlir, :lowered, :llvm, :ptx
-println(code_gpu(vadd!(get_backend(a), 256), c, a, b; ndrange=n, level=:ptx))
+# The code_* reflectors PRINT IR to stdout (or a given io), CUDA.jl-style.
+# Capture as a String with: sprint(io -> code_gpu(io, …))
+
+# GPU SIMT path — :sci, :mlir, :lowered, :llvm_unopt, :llvm, :ptx
+code_gpu(vadd!(get_backend(a), 256), c, a, b; ndrange=n, level=:ptx)
 
 # CPU SPMD path
-println(code_mlir(vadd_spmd, (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int)))
-println(code_llvm(vadd_spmd, (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int)))
+code_mlir(vadd_spmd, (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int))
+code_llvm(vadd_spmd, (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int))
 ```
 
 `examples/reflection_and_perf.jl` prints all five GPU levels for vadd and
@@ -182,10 +185,12 @@ spmd_function(f, argtypes::Type; lane_width=16, alignment=16, serial=false) → 
 (k::CPUKernel)(args...; blocks)                       → nothing
 
 # Reflection
-code_mlir(f, argtypes; lane_width=16, alignment=16)   → String   # CPU, pre-pipeline
-code_mlir_lowered(f, argtypes; …)                     → String   # CPU, post-pipeline
-code_llvm(f, argtypes; …)                             → String   # CPU LLVM IR
-code_gpu(kernel, args…; ndrange, level=:ptx)          → String   # GPU, any level
+# PRINT IR to io (default stdout) via each object's own printer; return nothing
+# (CUDA.jl-style). Capture with `sprint(io -> code_*(io, …))`.
+code_mlir([io], f, argtypes; lane_width=16, alignment=16)   # CPU, pre-pipeline
+code_mlir_lowered([io], f, argtypes; …)                     # CPU, post-pipeline
+code_llvm([io], f, argtypes; …)                             # CPU LLVM IR
+code_gpu([io], kernel, args…; ndrange, level=:ptx)          # GPU (sci/mlir/lowered/llvm_unopt/llvm/ptx)
 
 # GPU launch is the KernelAbstractions surface; the backend comes from the data:
 #   kernel(get_backend(mlirarray), workgroupsize)(args…; ndrange)

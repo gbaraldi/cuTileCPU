@@ -32,7 +32,7 @@ end
     # Reflection: the emitted MLIR should contain the vector arith op and
     # one of the vector memory ops (transfer_read / gather) at the lane
     # width.
-    mlir = MLIRKernels.code_mlir(vadd_spmd,
+    mlir = _ir(MLIRKernels.code_mlir, vadd_spmd,
         (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int);
         lane_width)
     @test occursin("vector<16xf32>", mlir)
@@ -69,7 +69,7 @@ end
 
     # MLIR should now contain the alignment hint AND a strided<[1]>
     # layout on the memref args.
-    mlir = MLIRKernels.code_mlir(vadd_spmd,
+    mlir = _ir(MLIRKernels.code_mlir, vadd_spmd,
         (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int);
         lane_width, alignment=128)
     @test occursin("memref.assume_alignment", mlir)

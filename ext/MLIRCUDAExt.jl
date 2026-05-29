@@ -515,20 +515,30 @@ end
 # code_gpu — reflection entry points (see MLIRKernels.code_gpu docstring).
 # ----------------------------------------------------------------------------
 
+# Like CUDA.jl's `code_ptx`/`code_llvm`: PRINT the IR (from each level's own
+# printer) to `io` (default stdout) and return nothing. The text is captured per
+# stage in `_codegen_stages` (the IR objects mutate in place across the pipeline,
+# so a snapshot is required). Capture via `sprint(io -> code_gpu(io, …))`.
+
 # Low-level form: explicit (gpu_body, full_argtypes::Type). `optimize` toggles the
 # SCI optimization passes (DCE/CSE/LICM) — handy for opt-vs-raw codegen diffs.
-function MK.code_gpu(@nospecialize(f), full_argtypes::Type; level::Symbol=:ptx,
+function MK.code_gpu(io::IO, @nospecialize(f), full_argtypes::Type; level::Symbol=:ptx,
                      sm="sm_90", feat="+ptx80", nd_dims=Int[], optimize::Bool=true)
     stages = _codegen_stages(f, full_argtypes; sm, feat, upto=level, nd_dims, optimize)
-    return stages[level]
+    print(io, stages[level])
+    return nothing
 end
+MK.code_gpu(@nospecialize(f), full_argtypes::Type; kwargs...) =
+    MK.code_gpu(stdout, f, full_argtypes; kwargs...)
 
 # Ergonomic form: a KA kernel + launch args (mirrors a `(obj)(args…; ndrange)`).
-function MK.code_gpu(obj::KA.Kernel{MLIRCUDABackend}, args...; level::Symbol=:ptx,
+function MK.code_gpu(io::IO, obj::KA.Kernel{MLIRCUDABackend}, args...; level::Symbol=:ptx,
                      ndrange=nothing, workgroupsize=nothing, sm="sm_90", feat="+ptx80",
                      optimize::Bool=true)
     full_argtypes, nd, _wg = _launch_setup(obj, args, ndrange, workgroupsize)
-    return MK.code_gpu(obj.f, full_argtypes; level, sm, feat, nd_dims=Int[nd...], optimize)
+    return MK.code_gpu(io, obj.f, full_argtypes; level, sm, feat, nd_dims=Int[nd...], optimize)
 end
+MK.code_gpu(obj::KA.Kernel{MLIRCUDABackend}, args...; kwargs...) =
+    MK.code_gpu(stdout, obj, args...; kwargs...)
 
 end # module MLIRCUDAExt

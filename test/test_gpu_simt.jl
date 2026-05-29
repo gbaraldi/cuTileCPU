@@ -257,10 +257,10 @@ end
         ar = MLIRArray(CUDA.rand(Float32, 256)); br = MLIRArray(CUDA.rand(Float32, 256))
         cr = MLIRArray(CUDA.zeros(Float32, 256))
         kr = _g_vadd!(backend, 256)
-        @test occursin("gpu.func",        code_gpu(kr, cr, ar, br; ndrange=256, level=:mlir))
-        @test occursin("llvm.",           code_gpu(kr, cr, ar, br; ndrange=256, level=:lowered))
-        @test occursin("ptx_kernel",      code_gpu(kr, cr, ar, br; ndrange=256, level=:llvm))
-        @test occursin(".visible .entry", code_gpu(kr, cr, ar, br; ndrange=256, level=:ptx))
+        @test occursin("gpu.func",        _ir(code_gpu, kr, cr, ar, br; ndrange=256, level=:mlir))
+        @test occursin("llvm.",           _ir(code_gpu, kr, cr, ar, br; ndrange=256, level=:lowered))
+        @test occursin("ptx_kernel",      _ir(code_gpu, kr, cr, ar, br; ndrange=256, level=:llvm))
+        @test occursin(".visible .entry", _ir(code_gpu, kr, cr, ar, br; ndrange=256, level=:ptx))
 
         # tiled matmul
         for nm in (256, 512)
@@ -331,10 +331,10 @@ end
         # `optimize` toggle lets us compare against the un-optimized lowering.
         nlines(s) = count('\n', s)
         nops(s)   = count(r"= [a-z_]+\.[a-z_]+", s)   # MLIR op-result lines
-        raw_sci = code_gpu(k, c, a, b; ndrange=N, level=:sci,  optimize=false)
-        opt_sci = code_gpu(k, c, a, b; ndrange=N, level=:sci,  optimize=true)
-        raw_ir  = code_gpu(k, c, a, b; ndrange=N, level=:mlir, optimize=false)
-        opt_ir  = code_gpu(k, c, a, b; ndrange=N, level=:mlir, optimize=true)
+        raw_sci = _ir(code_gpu, k, c, a, b; ndrange=N, level=:sci,  optimize=false)
+        opt_sci = _ir(code_gpu, k, c, a, b; ndrange=N, level=:sci,  optimize=true)
+        raw_ir  = _ir(code_gpu, k, c, a, b; ndrange=N, level=:mlir, optimize=false)
+        opt_ir  = _ir(code_gpu, k, c, a, b; ndrange=N, level=:mlir, optimize=true)
         @test nlines(opt_sci) < nlines(raw_sci)   # passes transform the structured IR
         @test nops(opt_ir)   <  nops(raw_ir)      # ...and that reaches the emitted MLIR
         # The optimized kernel (the default path) still computes the right result.
