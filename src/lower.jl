@@ -119,11 +119,12 @@ mutable struct LowerCtx
     wg_dims::Vector{Int}
     nd_dims::Vector{Int}
     # ----- @localmem / SharedMemory -----
-    # SSA id → (workgroup-space memref alloca, element type). Keyed by both the
-    # `shared_alloc` marker result and the `getfield(shared, :ref)` SSA, so
-    # memoryrefnew/get/set on a `@localmem` buffer route to the alloca instead
-    # of an argument-backed memref.
-    local_memrefs::Dict{Int, Tuple{IR.Value, Type}}
+    # SSA id → (buffer memref, element type, static Julia dims). Keyed by both
+    # the `shared_alloc`/`private_alloc` marker result and the
+    # `getfield(buf, :ref)` SSA, so memoryrefnew/get/set/@atomic on a
+    # `@localmem`/`@private` buffer route to it. The dims (Julia/column-major
+    # order) let `size(buf, d)` resolve to the static constant `dims[d]`.
+    local_memrefs::Dict{Int, Tuple{IR.Value, Type, Vector{Int}}}
     # The gpu.module body block (GPU path only). `@localmem` buffers are emitted
     # as workgroup-space `memref.global`s here (siblings of the gpu.func), which
     # gpu-to-nvvm lowers to real `.shared` — unlike `memref.alloca(workgroup)`,
@@ -144,7 +145,7 @@ LowerCtx(ctx, mod) = LowerCtx(
     Set{Int}(), nothing,
     false, 16, 0, Int64,
     Int[], Int[],
-    Dict{Int, Tuple{IR.Value, Type}}(), nothing)
+    Dict{Int, Tuple{IR.Value, Type, Vector{Int}}}(), nothing)
 
 # ----------------------------------------------------------------------------
 # Type translation: Julia → MLIR
@@ -2976,11 +2977,19 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
         lc.field_refs[idx] = (obj.n, fld_sym)
         return nothing
     elseif obj isa SSAValue
-        # `@localmem`-rooted: `getfield(shared, :ref)` on a shared_alloc result.
-        # Propagate the (alloca, elem_T) so memoryrefnew on this ref hits the
-        # workgroup buffer.
+        # `@localmem`/`@private`-rooted getfield on a local-buffer marker:
+        #   :ref  → propagate the buffer mapping (memoryrefnew routes to it).
+        #   :size → the buffer's STATIC dims as a tracked constant tuple, so
+        #           `size(buf, d)` (used in the column-major linearisation of a
+        #           multi-dim `buf[i,j]`) resolves to the constant `dims[d]`.
         if haskey(lc.local_memrefs, obj.id)
-            lc.local_memrefs[idx] = lc.local_memrefs[obj.id]
+            fld = args[2] isa QuoteNode ? args[2].value : args[2]
+            if fld === :size
+                (_, _, dims) = lc.local_memrefs[obj.id]
+                lc.tuples[idx] = collect(Any, dims)
+            else
+                lc.local_memrefs[idx] = lc.local_memrefs[obj.id]
+            end
             return nothing
         end
         # KernelState-rooted: `getfield(kernel_state_ssa, :seed)` → seed param.
@@ -4028,13 +4037,13 @@ function emit_local_buffer!(lc::LowerCtx, idx::Int, args, shared::Bool)
         end
         buf = IR.result(_memref.get_global(; result=memref_t,
                         name=parse(IR.Attribute, "@" * sym)))
-        lc.local_memrefs[idx] = (buf, T)
+        lc.local_memrefs[idx] = (buf, T, collect(Int, dims))
     else
         # Default-space alloca: per-block @localmem on CPU, OR per-thread
         # @private on either path (each lane its own copy; `.local` on GPU).
         memref_t = IR.MemRefType(elem, shape, IR.Attribute(), IR.Attribute())
         alloca = IR.result(_memref.alloca(IR.Value[], IR.Value[]; memref=memref_t))
-        lc.local_memrefs[idx] = (alloca, T)
+        lc.local_memrefs[idx] = (alloca, T, collect(Int, dims))
     end
     return nothing
 end
@@ -4154,7 +4163,7 @@ function emit_spmd_atomic_modifyindex!(lc::LowerCtx, args, @nospecialize(typ))
     # Argument or `getfield(arr,:ref)` tracked in lc.field_refs).
     base, elem_T =
         if mem_ref isa SSAValue && haskey(lc.local_memrefs, mem_ref.id)
-            (buf, et) = lc.local_memrefs[mem_ref.id]
+            (buf, et, _) = lc.local_memrefs[mem_ref.id]
             (_flatten_memref(buf), et)
         else
             arg_id =
@@ -4279,7 +4288,7 @@ function emit_spmd_memoryrefnew!(lc::LowerCtx, idx::Int, args, @nospecialize(typ
     # `@localmem` buffer: ref roots at a shared_alloc (workgroup memref), not an
     # arg. Flatten the rank-N alloca to rank-1 for the linear index, same as args.
     if ref_ref isa SSAValue && haskey(lc.local_memrefs, ref_ref.id)
-        (alloca, elem_T) = lc.local_memrefs[ref_ref.id]
+        (alloca, elem_T, _dims) = lc.local_memrefs[ref_ref.id]
         base_memref = _flatten_memref(alloca)
         return _emit_spmd_offset!(lc, idx, args, base_memref, elem_T)
     end

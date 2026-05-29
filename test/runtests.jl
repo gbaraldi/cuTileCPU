@@ -2473,6 +2473,38 @@ end
             Mp = 4; inpp = CUDA.CuArray(collect(1:Np)); op = CUDA.zeros(Int, Np)
             (@eval _g_privarr!)(GPUB(), Wp)(op, inpp, Val(Mp); ndrange=Np); CUDA.synchronize()
             @test Array(op) == [i * sum(1:Mp) for i in 1:Np]       # per-thread array + Val arg
+
+            # 2-D @localmem tile: size(tile,d) (the column-major linearisation
+            # of tile[i,j]) resolves to the static dims. Copy + cross-lane
+            # transpose through a 16x16 shared tile.
+            @eval begin
+                @kernel function _g_tilecopy!(o, @Const(a))
+                    I, J = @index(Global, NTuple); ii, jj = @index(Local, NTuple)
+                    t = @localmem Float32 (16, 16)
+                    @inbounds t[ii, jj] = a[I, J]
+                    @synchronize
+                    @inbounds o[I, J] = t[ii, jj]
+                end
+                @kernel function _g_tiletr!(o, @Const(a))
+                    I, J = @index(Global, NTuple); ii, jj = @index(Local, NTuple)
+                    t = @localmem Float32 (16, 16)
+                    @inbounds t[ii, jj] = a[I, J]
+                    @synchronize
+                    @inbounds o[I, J] = t[jj, ii]
+                end
+            end
+            Mt = 32
+            int = CUDA.CuArray(reshape(collect(Float32, 1:(Mt*Mt)), Mt, Mt)); iht = Array(int)
+            otc = CUDA.zeros(Float32, Mt, Mt)
+            (@eval _g_tilecopy!)(GPUB(), (16,16))(otc, int; ndrange=(Mt,Mt)); CUDA.synchronize()
+            @test Array(otc) == iht                                # 2-D tile copy
+            ott = CUDA.zeros(Float32, Mt, Mt)
+            (@eval _g_tiletr!)(GPUB(), (16,16))(ott, int; ndrange=(Mt,Mt)); CUDA.synchronize()
+            reft = copy(iht)
+            for bi in 0:1, bj in 0:1, ai in 1:16, aj in 1:16
+                reft[bi*16+ai, bj*16+aj] = iht[bi*16+aj, bj*16+ai]
+            end
+            @test Array(ott) == reft                               # 2-D tile cross-lane transpose
         end
     end
 
