@@ -164,6 +164,13 @@ end
     I = @index(Global, Cartesian)
     @inbounds B[I[2], I[1]] = A[I[1], I[2]]
 end
+# Numeric-union scf.if result: `flag ? Int32 : Int64` → Union{Int32,Int64},
+# promoted to a common type; the i64 result is stored back into the Int32 array.
+@kernel function _g_unionsel!(out, @Const(a), flag::Bool)
+    i = @index(Global, Linear)
+    v = flag ? a[i] : Int64(7)
+    @inbounds out[i] = v % Int32
+end
 
 @testset "GPU: KA @kernel on MLIRCUDABackend (SIMT)" begin
     if !CUDA.functional()
@@ -298,5 +305,14 @@ end
         mta = MLIRArray(CUDA.CuArray(rand(Float32, 100, 70))); mta0 = Array(mta)
         _g_cartdbl!(backend, (16, 16))(mta; ndrange=size(mta)); CUDA.synchronize()
         @test Array(mta) ≈ 2f0 .* mta0                         # 2-D masked tail
+
+        # Numeric union scf.if result (Union{Int32,Int64}) promoted to a common
+        # type, then stored back into the Int32 array (value coerced at the store).
+        ua = MLIRArray(CUDA.CuArray(collect(Int32, 1:64))); uo = MLIRArray(CUDA.zeros(Int32, 64))
+        _g_unionsel!(backend, 16)(uo, ua, true; ndrange=64); CUDA.synchronize()
+        @test Array(uo) == collect(Int32, 1:64)                # union branch: a[i]
+        uo2 = MLIRArray(CUDA.zeros(Int32, 64))
+        _g_unionsel!(backend, 16)(uo2, ua, false; ndrange=64); CUDA.synchronize()
+        @test all(Array(uo2) .== Int32(7))                     # union branch: Int64(7)%Int32
     end
 end

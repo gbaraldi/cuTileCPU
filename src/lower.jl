@@ -903,7 +903,8 @@ end
 #   :for   — `scf.for` body. ContinueOp becomes `scf.yield <new-iter-args>`.
 # Returns the terminator's MLIR Value-list (or empty Vec) for callers that
 # care (currently unused; we emit the terminator op inline).
-function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry)
+function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
+                     yield_types::Vector{Type}=Type[])
     for (idx, entry) in block
         stmt = entry.stmt
         typ  = entry.type
@@ -933,10 +934,16 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry)
             return
         elseif term isa YieldOp
             vals = IR.Value[]
-            for v in term.values
+            for (k, v) in enumerate(term.values)
                 resolved = resolve_value_or_const(lc, v)
                 resolved === nothing &&
                     error("scf.yield: cannot resolve operand $v")
+                # If the if-result type was promoted (numeric union), coerce this
+                # branch's yield to the common type so both branches agree.
+                if k <= length(yield_types) && yield_types[k] isa Type &&
+                   yield_types[k] <: Number
+                    resolved = _coerce_numeric!(resolved, yield_types[k])
+                end
                 push!(vals, resolved)
             end
             _scf.yield(vals)
@@ -1480,6 +1487,39 @@ function _int_width(t)
     et == IR.Type(Int32) && return 32
     et == IR.Type(Int64) && return 64
     return 0
+end
+
+# Bit width of the float element behind MLIR type `t` (0 if not float).
+function _float_width(t)
+    et = IR.isvector(t) ? eltype(t) : t
+    (et == IR.Type(Float16) || et == IR.Type(BFloat16)) && return 16
+    et == IR.Type(Float32) && return 32
+    et == IR.Type(Float64) && return 64
+    return 0
+end
+
+# Coerce a numeric Value to `target_T`'s MLIR type (vector-aware). Used when an
+# scf.if yields a numeric *union* across branches (e.g. `init=0::Int64` mixed
+# with an `Int32` array): the branches are promoted to a common type, so each
+# branch's yield must be widened/converted to it. Signed integers assumed.
+function _coerce_numeric!(v::IR.Value, target_T::Type)
+    out_t = _conv_out_type(v, target_T)
+    IR.type(v) == out_t && return v
+    src_int = _int_width(IR.type(v)) != 0
+    dst_int = target_T <: Integer
+    if src_int && dst_int
+        wv, wt = _int_width(IR.type(v)), _int_width(out_t)
+        return wt > wv ? IR.result(_arith.extsi(v; out=out_t)) :
+               wt < wv ? IR.result(_arith.trunci(v; out=out_t)) : v
+    elseif src_int          # int → float
+        return IR.result(_arith.sitofp(v; out=out_t))
+    elseif dst_int          # float → int
+        return IR.result(_arith.fptosi(v; out=out_t))
+    else                    # float → float
+        wv, wt = _float_width(IR.type(v)), _float_width(out_t)
+        return wt > wv ? IR.result(_arith.extf(v; out=out_t)) :
+               wt < wv ? IR.result(_arith.truncf(v; out=out_t)) : v
+    end
 end
 
 # Integer shift: `arith.{shl,shr*}i` require both operands to share a type, but
@@ -2101,10 +2141,10 @@ function emit_if!(lc::LowerCtx, idx::Int, op::IfOp, @nospecialize(typ))
     push!(else_region, else_block)
 
     @with_block then_block begin
-        walk_block!(lc, op.then_region; kind=:if)
+        walk_block!(lc, op.then_region; kind=:if, yield_types=jl_yield_types)
     end
     @with_block else_block begin
-        walk_block!(lc, op.else_region; kind=:if)
+        walk_block!(lc, op.else_region; kind=:if, yield_types=jl_yield_types)
     end
 
     ifop = _scf.if_(cond_v; results=result_types,
@@ -2124,8 +2164,18 @@ function if_result_types(@nospecialize(typ))
     rts = IR.Type[]
     jls = Type[]
     for p in typ.parameters
-        push!(jls, p)
-        if p isa Type && p <: Number
+        if p isa Union
+            # A branch-divergent numeric value (e.g. `init=0::Int64` mixed with an
+            # `Int32` array yields `Union{Int32,Int64}`). Promote to a common
+            # concrete type; the branch yields are coerced to it in walk_block!.
+            members = Base.uniontypes(p)
+            all(m -> m isa Type && m <: Number, members) ||
+                error("scf.if: unsupported union yield type $p")
+            pt = reduce(promote_type, members)
+            push!(jls, pt)
+            push!(rts, mlir_elem_type(pt))
+        elseif p isa Type && p <: Number
+            push!(jls, p)
             push!(rts, mlir_elem_type(p))
         else
             error("scf.if: unsupported yield type $p")
@@ -2928,6 +2978,14 @@ function emit_spmd_memoryrefset!(lc::LowerCtx, args, @nospecialize(typ))
     val_v = resolve_value_or_const(lc, args[2])
     val_v === nothing &&
         error("SPMD memoryrefset!: cannot resolve value operand $(args[2])")
+    # Coerce the value to the array's element type if it differs — e.g. a value
+    # promoted from a numeric union (`scf.if` across Int32/Int64 branches) stored
+    # into a narrower array. This is Julia's implicit `convert` at the store,
+    # minus the overflow check we elide like other in-kernel throws.
+    if off.elem_type isa Type && off.elem_type <: Number &&
+       IR.type(val_v) != _conv_out_type(val_v, off.elem_type)
+        val_v = _coerce_numeric!(val_v, off.elem_type)
+    end
 
     if isempty(off.idx_shape)
         # Scalar store.
