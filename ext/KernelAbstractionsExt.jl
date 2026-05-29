@@ -54,15 +54,22 @@ struct MLIRBackend <: KA.GPU end
 # `__index_Global_Linear(ctx)` → global linear thread index (1-based).
 @overlay FE.METHOD_TABLE KA.__index_Global_Linear(ctx) = FE.Intrinsics.global_index()
 
-# `@index(Local, Linear)` / `@index(Group, Linear)` / `@groupsize` expand to
-# one-arg `(ctx)` calls (the `:Linear` kind is a macro-stripped literal), so
-# the unary overlay is the matching one. KA's 2-arg `(ctx, ::CartesianIndex)`
-# defs in cpu.jl are CPU-emit-only and never reached on the Frontend path.
-# NOTE: `groupsize` returns a SCALAR Int32 here (not an NTuple) — kernels use
-# `@groupsize()` without `[1]` indexing.
+# `@index(Local, Linear)` / `@index(Group, Linear)` expand to one-arg `(ctx)`
+# calls (the `:Linear` kind is a macro-stripped literal), so the unary overlay
+# is the matching one. KA's 2-arg `(ctx, ::CartesianIndex)` defs in cpu.jl are
+# CPU-emit-only and never reached on the Frontend path.
 @overlay FE.METHOD_TABLE KA.__index_Local_Linear(ctx) = FE.Intrinsics.local_index()
 @overlay FE.METHOD_TABLE KA.__index_Group_Linear(ctx) = FE.Intrinsics.group_index()
-@overlay FE.METHOD_TABLE KA.groupsize(ctx)            = FE.Intrinsics.group_size()
+
+# `@groupsize()` → the workgroup size as an `NTuple` (KA semantics). We return
+# the STATIC size straight off the ctx type (the workgroup `StaticSize` is the
+# NDRange's 3rd type param) so it's a COMPILE-TIME CONSTANT — essential because
+# `@localmem T (@groupsize())` and `prod(@groupsize())` feed `Val{Dims}`, which
+# needs a constant. The runtime `group_size()` marker (block_dim) is kept only
+# for a future DynamicSize path.
+@overlay FE.METHOD_TABLE KA.groupsize(
+        ctx::KA.CompilerMetadata{A, B, C, D, <:NDI.NDRange{N, BL, WGS}}) where {A, B, C, D, N, BL, WGS} =
+    NDI.get(WGS)
 
 # `@index(Global/Local/Group, NTuple)` → unary `__index_*_NTuple(ctx)` returning
 # an `NTuple{N,Int}` of 1-based per-dim coords. We read the grid dimensionality
@@ -96,6 +103,27 @@ struct MLIRBackend <: KA.GPU end
 # shared memory on the SIMT path); `@synchronize` becomes a `gpu.barrier`.
 @overlay FE.METHOD_TABLE KA.SharedMemory(::Type{T}, ::Val{Dims}, ::Val) where {T, Dims} =
     FE.Intrinsics.shared_alloc(T, Val(Dims))
+
+# `for i in start:step:stop` builds a StepRange whose last element comes from
+# `Base.steprange_last`. The default pulls in `ArgumentError`, a `@noinline
+# overflow_case`, and `checked_srem_int` — none of which lower. This GPU-safe
+# version (mirroring cuTile's) uses plain unsigned `rem`. Needed e.g. by KA's
+# histogram (`for min_element in 1:gs:N`). Must be `@consistent_overlay` +
+# `:foldable` (like cuTile) — plain `@overlay` isn't honoured inside the range
+# machinery's :consistent context, so the default (un-lowerable) version leaks
+# through.
+Base.Experimental.@consistent_overlay FE.METHOD_TABLE function Base.steprange_last(start::T, step::T, stop::T) where {T <: Base.BitInteger}
+    stop == start && return stop
+    if step > zero(step)
+        stop < start && return start - oneunit(step)
+        remain = signed(unsigned(stop - start) % unsigned(step))
+        return stop - remain
+    else
+        stop > start && return start + oneunit(step)
+        remain = signed(unsigned(start - stop) % unsigned(-step))
+        return stop + remain
+    end
+end
 
 # `@private` / Scratchpad — not yet wired up.
 @overlay FE.METHOD_TABLE KA.Scratchpad(ctx, ::Type, ::Val) =

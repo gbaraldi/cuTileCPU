@@ -2406,6 +2406,44 @@ end
             (@eval _g_blocksum!)(GPUB(), Wl)(osum, inl; ndrange=Nl); CUDA.synchronize()
             refsum = [sum(ihl[(b*Wl+1):((b+1)*Wl)]) for b in 0:(NBl-1)]
             @test isapprox(Array(osum), refsum; rtol=1f-4)   # atomic-on-shared
+
+            # The full KA histogram example (verbatim): @localmem + two-level
+            # shared→global @atomic + @synchronize + @groupsize + a 1:gs:N
+            # step-range loop + divergent per-thread ifs. The headline kernel.
+            @eval begin
+                using KernelAbstractions: @uniform, @groupsize
+                @kernel unsafe_indices=true function _g_histogram!(histogram_output, input)
+                    gid = @index(Group, Linear)
+                    lid = @index(Local, Linear)
+                    @uniform gs = prod(@groupsize())
+                    tid = (gid - 1) * gs + lid
+                    @uniform Nh = length(histogram_output)
+                    shared_histogram = @localmem eltype(input) (gs)
+                    for min_element in 1:gs:Nh
+                        @inbounds shared_histogram[lid] = 0
+                        @synchronize()
+                        max_element = min_element + gs
+                        if max_element > Nh
+                            max_element = Nh + 1
+                        end
+                        bin = tid <= length(input) ? input[tid] : 0
+                        if bin >= min_element && bin < max_element
+                            bin -= min_element - 1
+                            @atomic shared_histogram[bin] += 1
+                        end
+                        @synchronize()
+                        if ((lid + min_element - 1) <= Nh)
+                            @atomic histogram_output[lid + min_element - 1] += shared_histogram[lid]
+                        end
+                    end
+                end
+            end
+            Lh = 4096; NBINS = 256
+            hin = rand(1:NBINS, Lh)
+            dhin = CUDA.CuArray(hin); dhout = CUDA.zeros(Int, NBINS)
+            (@eval _g_histogram!)(GPUB(), (256,))(dhout, dhin; ndrange=Lh); CUDA.synchronize()
+            hist_ref = zeros(Int, NBINS); for v in hin; hist_ref[v] += 1; end
+            @test Array(dhout) == hist_ref                   # full KA histogram
         end
     end
 

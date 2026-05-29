@@ -155,7 +155,13 @@ CC.InferenceParams(i::FrontendInterpreter)     = i.inf_params
 CC.OptimizationParams(i::FrontendInterpreter)  = i.opt_params
 CC.get_inference_cache(i::FrontendInterpreter) = i.inf_cache
 CC.method_table(i::FrontendInterpreter)        = i.method_table
-CC.cache_owner(::FrontendInterpreter)          = nothing
+# A custom (non-`nothing`) cache owner is REQUIRED for overlays to apply to
+# Base/stdlib callees. With `nothing`, the interpreter reuses Julia's native
+# (precompiled) CodeInstances — e.g. Base's range machinery already resolved
+# `steprange_last` to the un-lowerable default, so our `@overlay` was bypassed.
+# A private owner forces re-inference of reachable methods through our overlay
+# method table. (cuTile does the same via its `CacheView` owner.)
+CC.cache_owner(::FrontendInterpreter)          = :MLIRKernelsFrontend
 @static if isdefined(CC, :get_inference_world)
     CC.get_inference_world(i::FrontendInterpreter) = i.world
 else

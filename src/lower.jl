@@ -1730,7 +1730,11 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
     elseif fname === :iota
         return emit_iota!(lc, args, typ)
 
-    elseif fname === :bitcast
+    elseif fname === :bitcast && !lc.spmd
+        # cuTile's bitcast intrinsic is (value, type)-ordered. Raw Julia
+        # `Base.bitcast(T, x)` is (type, value) and is handled by the
+        # _RAW_CORE_INTRINSICS path below (which swaps) — so on the SPMD/GPU
+        # path fall through to it rather than mis-ordering the operands.
         return emit_bitcast!(lc, args, typ)
 
     elseif fname === :offset
@@ -1972,6 +1976,11 @@ const _RAW_CORE_INTRINSICS = Set{Symbol}([
     # :absf/:sqrt/etc, but the Frontend path hands them raw). One operand,
     # operand-typed result — vector-aware via emit_unary_math!.
     :abs_float, :sqrt_llvm, :sqrt_llvm_fast,
+    # Integer div/rem (incl. the overflow/zero-"checked" variants — the check is
+    # a div-by-zero guard the kernel is responsible for; we emit the unchecked
+    # arith op). Needed e.g. by the steprange_last overlay's unsigned rem.
+    :udiv_int, :sdiv_int, :urem_int, :srem_int,
+    :checked_udiv_int, :checked_sdiv_int, :checked_urem_int, :checked_srem_int,
 ])
 
 # A constant matching `v`'s MLIR type (scalar or vector<N×elem>) holding the
@@ -2018,6 +2027,10 @@ function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecializ
     name === :and_int   && return emit_binop_value!(lc, args, _arith.andi)
     name === :or_int    && return emit_binop_value!(lc, args, _arith.ori)
     name === :xor_int   && return emit_binop_value!(lc, args, _arith.xori)
+    (name === :udiv_int || name === :checked_udiv_int) && return emit_binop_value!(lc, args, _arith.divui)
+    (name === :sdiv_int || name === :checked_sdiv_int) && return emit_binop_value!(lc, args, _arith.divsi)
+    (name === :urem_int || name === :checked_urem_int) && return emit_binop_value!(lc, args, _arith.remui)
+    (name === :srem_int || name === :checked_srem_int) && return emit_binop_value!(lc, args, _arith.remsi)
     if name === :neg_float
         v = resolve_value_or_const(lc, args[1])
         v === nothing && error("neg_float: unresolved operand")
