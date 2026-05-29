@@ -184,8 +184,11 @@ function _link_libdevice!(lmod)
 end
 
 # gpu.binary{format=llvm} bitcode → (LLVM.Module, PTX string), with libdevice
-# linked. The driver JITs PTX → SASS at module load.
-function _bitcode_to_ptx(bc; sm="sm_90", feat="+ptx80")
+# linked and LLVM's default -O2 run. The driver JITs PTX → SASS at module load.
+# `stages`, when given, captures the LLVM IR before (`:llvm_unopt`) and after
+# (`:llvm`) the -O2 pipeline — for reflection / `code_gpu`.
+function _bitcode_to_ptx(bc; sm="sm_90", feat="+ptx80",
+                         stages::Union{Nothing,Dict{Symbol,String}}=nothing)
     lctx = LLVM.Context()
     return LLVM.context!(lctx) do
         lmod = parse(LLVM.Module, bc)
@@ -194,17 +197,26 @@ function _bitcode_to_ptx(bc; sm="sm_90", feat="+ptx80")
         _link_libdevice!(lmod)            # parse libdevice in the SAME context, then link
         tm = LLVM.TargetMachine(LLVM.Target(; triple), triple, sm, feat)
         LLVM.asm_verbosity!(tm, true)
+        stages === nothing || (stages[:llvm_unopt] = string(lmod))   # linked, pre-O2
+        # We emit no LLVM-level optimization of our own; run LLVM's default -O2
+        # pipeline (inline/GVN/DCE) — also strips the lazily-linked libdevice down
+        # to the referenced functions. LLVM ≥17 weaves NVPTX's NVVMReflect in at
+        # PipelineStart, resolving libdevice's `__nvvm_reflect`. Job-free (the
+        # GPUCompiler `optimize_module!` is keyed on a CompilerJob we don't have).
+        LLVM.run!("default<O2>", lmod, tm)
+        stages === nothing || (stages[:llvm] = string(lmod))         # post-O2
         ptx = String(LLVM.emit(tm, lmod, LLVM.API.LLVMAssemblyFile))
         return lmod, ptx
     end
 end
 
 # Env-var kernel dumping. `MLIRKERNELS_DUMP` = a comma-separated subset of
-# sci,mlir,lowered,llvm,ptx (or "all") prints those levels for every GPU kernel
+# sci,mlir,lowered,llvm_unopt,llvm,ptx (or "all") prints those levels for every
+# GPU kernel — `llvm_unopt`/`llvm` are the LLVM IR before/after the -O2 pipeline
 # as it compiles; `MLIRKERNELS_DUMP_FILTER=<substr>` restricts to kernels whose
 # name contains <substr>. Best-effort (dumps whatever stages succeed) and goes
 # to stderr, so it works even when a kernel is launched deep inside a library.
-const _DUMP_ORDER = (:sci, :mlir, :lowered, :llvm, :ptx)
+const _DUMP_ORDER = (:sci, :mlir, :lowered, :llvm_unopt, :llvm, :ptx)
 
 function _maybe_dump_kernel(f, full_argtypes, kname; sm, feat, nd_dims, optimize=true)
     spec = get(ENV, "MLIRKERNELS_DUMP", "")
@@ -268,7 +280,7 @@ const _GPU_PASSES_NOBIN = GPU_PASSES[1:end-1]
 function _codegen_stages(f, full_argtypes; sm="sm_90", feat="+ptx80",
                          upto::Symbol=:ptx, nd_dims=Int[], optimize::Bool=true)
     kname = _sym(f)
-    order = (:sci, :mlir, :lowered, :llvm, :ptx)
+    order = (:sci, :mlir, :lowered, :llvm_unopt, :llvm, :ptx)
     want = findfirst(==(upto), order)
     want === nothing && error("code_gpu: unknown level :$upto (one of $order)")
     out = Dict{Symbol,String}()
@@ -289,12 +301,11 @@ function _codegen_stages(f, full_argtypes; sm="sm_90", feat="+ptx80",
         _run_passes!(mod, mlir_ctx, _GPU_PASSES_NOBIN)
         out[:lowered] = sprint(show, mod)
         want == 3 && return out
-        # Serialise to gpu.binary, extract bitcode → LLVM IR + PTX.
+        # Serialise to gpu.binary, extract bitcode → LLVM IR (pre/post-O2) + PTX.
         _run_passes!(mod, mlir_ctx, GPU_PASSES[end:end])
         bc = _extract_gpu_binary(mod)
-        lmod, ptx = _bitcode_to_ptx(bc; sm, feat)
-        out[:llvm] = string(lmod)   # LLVMPrintModuleToString; `show` gives only the wrapper repr
-        want >= 5 && (out[:ptx] = ptx)
+        _lmod, ptx = _bitcode_to_ptx(bc; sm, feat, stages=out)  # fills :llvm_unopt + :llvm
+        want >= findfirst(==(:ptx), order) && (out[:ptx] = ptx)
     end
     return out
 end

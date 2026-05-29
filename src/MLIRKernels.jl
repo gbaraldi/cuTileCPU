@@ -36,7 +36,7 @@ vadd!(get_backend(a), 256)(c, a, b; ndrange=n); CUDA.synchronize()
 ```julia
 # CPU SPMD path:
 println(code_mlir(spmd_kernel, (Vector{Float32}, Vector{Float32}, Int)))
-# GPU SIMT path — IR at any level (:sci, :mlir, :lowered, :llvm, :ptx):
+# GPU SIMT path — IR at any level (:sci, :mlir, :lowered, :llvm_unopt, :llvm, :ptx):
 println(code_gpu(vadd!(get_backend(a), 256), c, a, b; ndrange=n, level=:ptx))
 ```
 """
