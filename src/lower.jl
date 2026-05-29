@@ -743,7 +743,7 @@ end
 
 function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
                            kernel_name::String, module_name::String="kernels",
-                           lane_idx_type::Type=Int32,
+                           lane_idx_type::Type=Int32, nd_dims::Vector{Int}=Int[],
                            ctx_arg::Union{Nothing,Int}=nothing)
     ctx = fresh_context()
     mod_ref = Ref{IR.Module}()
@@ -763,6 +763,7 @@ function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
             lc.spmd = true                 # reuse the scalar-index SPMD clauses
             lc.lane_width = 1
             lc.lane_idx_type = lane_idx_type
+            lc.nd_dims = nd_dims           # ndrange sizes, for valid_index masking
 
             idx_t = IR.IndexType()
             global_attr = parse(IR.Attribute, "#gpu.address_space<global>")
@@ -1038,6 +1039,12 @@ function walk_expr!(lc::LowerCtx, idx::Int, e::Expr, @nospecialize(typ))
         T = e.args[1] isa Type ? e.args[1] :
             something(resolve_const(lc, e.args[1]), nothing)
         lc.new_structs[idx] = (T, collect(Any, e.args[2:end]))
+        return nothing
+    elseif e.head === :throw_undef_if_not
+        # `throw_undef_if_not(:name, cond)`: throw `UndefVarError` unless `cond`.
+        # Tail-block masking leaves values computed under `if __validindex` undef
+        # on the masked path, but a masked thread never reaches the use (its work
+        # is guarded) and a GPU throw is just a trap. Elide, like bounds checks.
         return nothing
     end
     error("MLIRKernels.walk_expr!: unhandled Expr head :$(e.head) at %$idx ($e)")
@@ -1317,6 +1324,35 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
     if fname === :barrier && lc.spmd
         lc.lane_width == 1 && _gpu.barrier()
         return nothing
+    end
+
+    # Tail-block masking. GPU SIMT: valid iff in range on every dim,
+    # `∧_d (thread_id.d + block_id.d*block_dim.d < ndrange[d])`. CPU SPMD: always
+    # true.
+    if fname === :valid_index && lc.spmd
+        if lc.gpu_module_block !== nothing && !isempty(lc.nd_dims)
+            idx_t = IR.IndexType()
+            dimnames = ("x", "y", "z")
+            slt = IR.Attribute(2, IR.Type(Int64))   # arith.cmpi signed-less-than
+            valid = nothing
+            for d in 1:length(lc.nd_dims)
+                da = parse(IR.Attribute, "#gpu<dim $(dimnames[d])>")
+                tid  = IR.result(_gpu.thread_id(; result_0=idx_t, dimension=da))
+                bid  = IR.result(_gpu.block_id(; result_0=idx_t, dimension=da))
+                bdim = IR.result(_gpu.block_dim(; result_0=idx_t, dimension=da))
+                off  = IR.result(_arith.muli(bid, bdim; result=idx_t))
+                g    = IR.result(_arith.addi(off, tid; result=idx_t))
+                ndc  = IR.result(_arith.constant(;
+                            value=IR.Attribute(lc.nd_dims[d], idx_t)))
+                cmp  = IR.result(_arith.cmpi(g, ndc; predicate=slt))
+                valid = valid === nothing ? cmp :
+                        IR.result(_arith.andi(valid, cmp))
+            end
+            return valid
+        end
+        # CPU SPMD path (or no ndrange info): every lane valid.
+        return IR.result(_arith.constant(;
+            value=IR.Attribute(true, IR.Type(Bool)), result=IR.Type(Bool)))
     end
 
     error("MLIRKernels.walk_call!: unhandled callee $fname " *

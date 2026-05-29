@@ -127,8 +127,8 @@ function _bitcode_to_ptx(bc; sm="sm_90", feat="+ptx80")
     return lmod, ptx
 end
 
-function _compile(f, full_argtypes; sm="sm_90", feat="+ptx80")
-    key = (f, full_argtypes, sm, feat)
+function _compile(f, full_argtypes; sm="sm_90", feat="+ptx80", nd_dims=Int[])
+    key = (f, full_argtypes, sm, feat, nd_dims)
     haskey(_gpu_cache, key) && return _gpu_cache[key]
     kname = _sym(f)
 
@@ -138,7 +138,7 @@ function _compile(f, full_argtypes; sm="sm_90", feat="+ptx80")
 
     # ctx (`__ctx__`) is arg slot 2 (slot 1 is the function itself).
     mod, _pjt, mlir_ctx, kinds =
-        MK.lower_to_mlir_gpu(sci, full_argtypes; kernel_name=kname, ctx_arg=2)
+        MK.lower_to_mlir_gpu(sci, full_argtypes; kernel_name=kname, ctx_arg=2, nd_dims)
 
     _run_passes!(mod, mlir_ctx, GPU_PASSES)
     bc = _extract_gpu_binary(mod)
@@ -160,7 +160,7 @@ end
 const _GPU_PASSES_NOBIN = GPU_PASSES[1:end-1]
 
 function _codegen_stages(f, full_argtypes; sm="sm_90", feat="+ptx80",
-                         upto::Symbol=:ptx)
+                         upto::Symbol=:ptx, nd_dims=Int[])
     kname = _sym(f)
     order = (:sci, :mlir, :lowered, :llvm, :ptx)
     want = findfirst(==(upto), order)
@@ -172,7 +172,7 @@ function _codegen_stages(f, full_argtypes; sm="sm_90", feat="+ptx80",
     want == 1 && return out
 
     mod, _pjt, mlir_ctx, _kinds =
-        MK.lower_to_mlir_gpu(sci, full_argtypes; kernel_name=kname, ctx_arg=2)
+        MK.lower_to_mlir_gpu(sci, full_argtypes; kernel_name=kname, ctx_arg=2, nd_dims)
     MK.@with_context mlir_ctx begin
         out[:mlir] = sprint(show, mod)
         want == 2 && return out
@@ -337,9 +337,9 @@ function _launch_setup(obj::KA.Kernel{MLIRCUDABackend}, args, ndrange, workgroup
     length(wg) == length(nd) || error(
         "MLIRCUDABackend: ndrange $nd ($(length(nd))-D) and workgroupsize $wg " *
         "($(length(wg))-D) must have the same number of dimensions.")
-    all(nd[d] % wg[d] == 0 for d in 1:length(wg)) || error(
-        "MLIRCUDABackend: ndrange=$nd not a per-dim multiple of workgroupsize=$wg " *
-        "(no tail-block masking yet — __validindex→true).")
+    # ndrange need not be a multiple of wg: the grid is padded (`cld`) and
+    # `__validindex` masks the tail. (`unsafe_indices=true` skips the mask, so it
+    # still needs an exact-multiple ndrange.)
     ctxT = _ctx_type(nd, wg)
     full_argtypes = Tuple{ctxT, map(a -> _host_argtype(typeof(a)), args)...}
     return full_argtypes, nd, wg
@@ -348,9 +348,9 @@ end
 function (obj::KA.Kernel{MLIRCUDABackend})(args...; ndrange=nothing,
                                                      workgroupsize=nothing)
     full_argtypes, nd, wg = _launch_setup(obj, args, ndrange, workgroupsize)
-    cufn, kinds = _compile(obj.f, full_argtypes)
+    cufn, kinds = _compile(obj.f, full_argtypes; nd_dims=Int[nd...])
     flat, sig = _marshal(args, kinds)
-    grid = map(cld, nd, wg)          # blocks per dim
+    grid = map(cld, nd, wg)          # blocks per dim (padded)
     cudacall(cufn, Tuple{sig...}, flat...; threads=wg, blocks=grid)
     return nothing
 end
@@ -361,16 +361,16 @@ end
 
 # Low-level form: explicit (gpu_body, full_argtypes::Type).
 function MK.code_gpu(@nospecialize(f), full_argtypes::Type; level::Symbol=:ptx,
-                     sm="sm_90", feat="+ptx80")
-    stages = _codegen_stages(f, full_argtypes; sm, feat, upto=level)
+                     sm="sm_90", feat="+ptx80", nd_dims=Int[])
+    stages = _codegen_stages(f, full_argtypes; sm, feat, upto=level, nd_dims)
     return stages[level]
 end
 
 # Ergonomic form: a KA kernel + launch args (mirrors a `(obj)(args…; ndrange)`).
 function MK.code_gpu(obj::KA.Kernel{MLIRCUDABackend}, args...; level::Symbol=:ptx,
                      ndrange=nothing, workgroupsize=nothing, sm="sm_90", feat="+ptx80")
-    full_argtypes, _nd, _wg = _launch_setup(obj, args, ndrange, workgroupsize)
-    return MK.code_gpu(obj.f, full_argtypes; level, sm, feat)
+    full_argtypes, nd, _wg = _launch_setup(obj, args, ndrange, workgroupsize)
+    return MK.code_gpu(obj.f, full_argtypes; level, sm, feat, nd_dims=Int[nd...])
 end
 
 end # module MLIRCUDAExt

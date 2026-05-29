@@ -13,14 +13,15 @@ Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
 MLIR = "bfde9dd4-8f40-4a1e-be09-1475335e1c92"
 MLIR_jll = "a70bccb4-a5c0-5e2e-a329-e731972457e8"
 
-[sources]
-MLIR = {path = "/home/gbaraldi/.julia/dev/MLIR"}
-
 [weakdeps]
 Atomix = "a9b6321e-bd34-4604-b9c9-b65b8de01458"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 LLVM = "929cbde3-209d-540e-8aea-75f648917ca0"
+
+[sources]
+IRStructurizer = {path = "/home/gbaraldi/gpufun/IRStructurizer"}
+MLIR = {path = "/home/gbaraldi/.julia/dev/MLIR"}
 
 [extensions]
 KernelAbstractionsExt = ["KernelAbstractions", "Atomix"]

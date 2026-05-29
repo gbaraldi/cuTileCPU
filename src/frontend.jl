@@ -53,6 +53,12 @@ module Intrinsics
         return compilerbarrier(:type, nothing)
     end
 
+    # Per-thread validity for tail-block masking (KA's `if __validindex(ctx)`).
+    # The walker lowers it to `∧_d (global_d < ndrange[d])` on GPU (padded last
+    # block's out-of-range threads do nothing), `true` on CPU. `compilerbarrier`
+    # keeps it from folding so the guarding `if` survives inference.
+    @noinline valid_index() = compilerbarrier(:type, true)::Bool
+
     # Atomic read-modify-write at a 1-based linear index. The KA extension
     # overlays `Atomix.modify!(IndexableRef, op, x, ord)` — i.e. `KA.@atomic` /
     # `Atomix.@atomic`, KA's *portable* atomic — onto this marker, stopping the

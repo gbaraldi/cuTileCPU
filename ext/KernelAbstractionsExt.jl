@@ -97,10 +97,9 @@ struct MLIRBackend <: KA.GPU end
         ctx::KA.CompilerMetadata{A,B,C,D,<:NDI.NDRange{N}}) where {A,B,C,D,N} =
     CartesianIndex(FE.Intrinsics.group_ntuple(Val(N)))
 
-# `__validindex(ctx)` — for launches where ndrange is a multiple of the
-# workgroup size, every lane is valid. Tighter (lane < ndrange) masking is a
-# TODO (thread `ndrange` through and emit a per-lane mask compare).
-@overlay FE.METHOD_TABLE KA.__validindex(ctx) = true
+# `__validindex(ctx)` — tail-block masking; walker lowers the marker (GPU:
+# `∧_d (global_d < ndrange[d])`, CPU: `true`).
+@overlay FE.METHOD_TABLE KA.__validindex(ctx) = FE.Intrinsics.valid_index()
 
 # `__synchronize()` → workgroup barrier marker. CPU SIMD has no warp barrier
 # so the walker lowers `:barrier` to a no-op; on the GPU SIMT path with no

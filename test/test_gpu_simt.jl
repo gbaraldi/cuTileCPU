@@ -287,5 +287,18 @@ end
         cta = CUDA.CuArray(rand(Float32, 8, 12)); ctb = CUDA.zeros(Float32, 12, 8)
         _g_carttr!(GPUB(), (4, 4))(ctb, cta; ndrange=size(cta)); CUDA.synchronize()
         @test Array(ctb) == permutedims(Array(cta))            # Cartesian I[k] transpose
+
+        # Tail-block masking: ndrange NOT a multiple of the workgroup. The grid
+        # is padded (cld) and __validindex masks the out-of-range tail threads
+        # (a tail thread that wrote would index out of bounds).
+        for Nt in (1000, 257)
+            ta = CUDA.CuArray(rand(Float32, Nt)); tb = CUDA.CuArray(rand(Float32, Nt))
+            tc = CUDA.zeros(Float32, Nt)
+            _g_vadd!(GPUB(), 256)(tc, ta, tb; ndrange=Nt); CUDA.synchronize()
+            @test Array(tc) == Array(ta) .+ Array(tb)          # 1-D masked tail
+        end
+        mta = CUDA.CuArray(rand(Float32, 100, 70)); mta0 = Array(mta)
+        _g_cartdbl!(GPUB(), (16, 16))(mta; ndrange=size(mta)); CUDA.synchronize()
+        @test Array(mta) ≈ 2f0 .* mta0                         # 2-D masked tail
     end
 end
