@@ -17,7 +17,7 @@ using Test
 
 # Load the standalone optimizer module directly (no MLIRKernels package needed).
 include(joinpath(@__DIR__, "..", "src", "transform", "optimize.jl"))
-using .SCIOpt: optimize_sci!, dce_pass!, cse_pass!, licm_pass!
+using .SCIOpt: optimize_sci!, dce_pass!, cse_pass!, licm_pass!, canonicalize_pass!
 
 using IRStructurizer: StructuredIRCode, validate_ssa_defs, instructions,
                       eachblock, resolve_call, insert_before!, Instruction
@@ -199,6 +199,21 @@ total_stmts(sci::StructuredIRCode) = count_calls(sci, nothing)
         let a = [10, 20, 30]
             @test execute(sci, copy(a), 2) == f(copy(a), 2)
         end
+    end
+
+    @testset "canonicalize: power-of-2 strength reduction" begin
+        # Julia keeps `mul_int(x, 8)` in the IR (it doesn't strength-reduce), so
+        # this rule fires on real inferred code: x*8 → x<<3.
+        sr(x::Int) = x * 8
+        sci = build_sci(sr, (Int,))
+        @test count_calls(sci, Base.mul_int) == 1
+        @test count_calls(sci, Base.shl_int) == 0
+        canonicalize_pass!(sci)
+        @test count_calls(sci, Base.mul_int) == 0   # mul → shl
+        @test count_calls(sci, Base.shl_int) == 1
+        @test validate_ssa_defs(sci)
+        sci2 = build_sci(sr, (Int,)); optimize_sci!(sci2)
+        @test execute(sci2, 7) == sr(7)             # 7*8 == 7<<3 == 56
     end
 
 end
