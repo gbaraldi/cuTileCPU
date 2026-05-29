@@ -2530,6 +2530,17 @@ end
             os2 = CUDA.zeros(Int, Ns)
             (@eval _g_unrollsum!)(GPUB(), Ws)(os2, as, Val(Ms); ndrange=Ns); CUDA.synchronize()
             @test Array(os2) == refs                               # @unroll
+
+            # code_gpu reflection: every codegen level emits its expected IR.
+            @eval @kernel function _g_radd!(c, @Const(a), @Const(b))
+                i = @index(Global, Linear); @inbounds c[i] = a[i] + b[i]
+            end
+            ar = CUDA.rand(Float32, 256); br = CUDA.rand(Float32, 256); cr = CUDA.zeros(Float32, 256)
+            kr = (@eval _g_radd!)(GPUB(), 256)
+            @test occursin("gpu.func",      code_gpu(kr, cr, ar, br; ndrange=256, level=:mlir))
+            @test occursin("llvm.",         code_gpu(kr, cr, ar, br; ndrange=256, level=:lowered))
+            @test occursin("ptx_kernel",    code_gpu(kr, cr, ar, br; ndrange=256, level=:llvm))
+            @test occursin(".visible .entry", code_gpu(kr, cr, ar, br; ndrange=256, level=:ptx))
         end
     end
 

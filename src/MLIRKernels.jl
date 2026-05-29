@@ -118,8 +118,29 @@ include("compile.jl")
 include("launch.jl")
 include("reflect.jl")
 
+"""
+    code_gpu(kernel_or_f, args...; level=:ptx, ndrange, workgroupsize, sm, feat) -> String
+
+Reflection for the KA → GPU SIMT path. Returns the kernel's intermediate
+representation at one stage of the codegen pipeline:
+
+  - `:sci`     — the StructuredIRCode (post-inference, post-overlay Julia IR)
+  - `:mlir`    — the high-level `gpu`-dialect MLIR module (pre-pipeline)
+  - `:lowered` — the LLVM/NVVM-dialect MLIR (after gpu→nvvm + memref/scf/arith
+                 lowering, before serialisation to a `gpu.binary`)
+  - `:llvm`    — the LLVM IR (textual `.ll`) carried in the `gpu.binary`
+  - `:ptx`     — the final PTX assembly (what the driver JITs to SASS)
+
+Two call forms (the method lives in `MLIRCUDAExt`; CUDA + LLVM + KA must be
+loaded):
+
+    code_gpu(kernel(MLIRCUDABackend(), wg), args...; ndrange, level=:ptx)
+    code_gpu(gpu_kernel_body, Tuple{CtxT, ArgTs...}; level=:ptx)
+"""
+function code_gpu end
+
 export aligned_array, cpu_function, parallel_for, @parallel_for,
        spmd_function, ka_function,
-       code_mlir, code_mlir_lowered, code_llvm
+       code_mlir, code_mlir_lowered, code_llvm, code_gpu
 
 end # module

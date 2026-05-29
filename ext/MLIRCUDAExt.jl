@@ -69,6 +69,31 @@ function _extract_gpu_binary(mod)
     error("MLIRCUDABackend: gpu pipeline produced no gpu.binary")
 end
 
+# Run an MLIR pass pipeline (list of pass strings) on `mod` in place.
+function _run_passes!(mod, mlir_ctx, passes)
+    IR.activate(mlir_ctx)
+    pm = IR.PassManager()
+    parse(IR.OpPassManager(pm), "builtin.module(" * join(passes, ",") * ")")
+    MLIRAPI.mlirPassManagerRunOnOp(pm, IR.Operation(mod)).value == 0 &&
+        error("MLIRCUDABackend: GPU pass pipeline failed")
+    return mod
+end
+
+# gpu.binary{format=llvm} bitcode → (LLVM.Module, PTX string). The driver JITs
+# PTX → SASS at module load.
+function _bitcode_to_ptx(bc; sm="sm_90", feat="+ptx80")
+    lctx = LLVM.Context()
+    lmod = LLVM.context!(lctx) do
+        parse(LLVM.Module, bc)
+    end
+    triple = "nvptx64-nvidia-cuda"
+    LLVM.triple!(lmod, triple)
+    tm = LLVM.TargetMachine(LLVM.Target(; triple), triple, sm, feat)
+    LLVM.asm_verbosity!(tm, true)
+    ptx = String(LLVM.emit(tm, lmod, LLVM.API.LLVMAssemblyFile))
+    return lmod, ptx
+end
+
 function _compile(f, full_argtypes; sm="sm_90", feat="+ptx80")
     key = (f, full_argtypes, sm, feat)
     haskey(_gpu_cache, key) && return _gpu_cache[key]
@@ -82,28 +107,54 @@ function _compile(f, full_argtypes; sm="sm_90", feat="+ptx80")
     mod, _pjt, mlir_ctx, kinds =
         MK.lower_to_mlir_gpu(sci, full_argtypes; kernel_name=kname, ctx_arg=2)
 
-    IR.activate(mlir_ctx)
-    pm = IR.PassManager()
-    parse(IR.OpPassManager(pm), "builtin.module(" * join(GPU_PASSES, ",") * ")")
-    MLIRAPI.mlirPassManagerRunOnOp(pm, IR.Operation(mod)).value == 0 &&
-        error("MLIRCUDABackend: GPU pass pipeline failed")
+    _run_passes!(mod, mlir_ctx, GPU_PASSES)
     bc = _extract_gpu_binary(mod)
-
-    # gpu.binary{format=llvm} carries LLVM bitcode; LLVM.jl's NVPTX backend
-    # serialises it to PTX (the CUDA driver JITs PTX → SASS at module load).
-    lctx = LLVM.Context()
-    lmod = LLVM.context!(lctx) do
-        parse(LLVM.Module, bc)
-    end
-    triple = "nvptx64-nvidia-cuda"
-    LLVM.triple!(lmod, triple)
-    tm = LLVM.TargetMachine(LLVM.Target(; triple), triple, sm, feat)
-    LLVM.asm_verbosity!(tm, true)
-    ptx = String(LLVM.emit(tm, lmod, LLVM.API.LLVMAssemblyFile))
+    _lmod, ptx = _bitcode_to_ptx(bc; sm, feat)
 
     cufn = CuFunction(CuModule(ptx), kname)
     _gpu_cache[key] = (cufn, kinds)
     return cufn, kinds
+end
+
+# ----------------------------------------------------------------------------
+# Reflection — capture every codegen level for the GPU path. Mirrors the
+# `_compile` pipeline but stops at, and returns the text of, each stage.
+# ----------------------------------------------------------------------------
+
+# Which passes to run to reach each level. `:lowered` is the full pipeline minus
+# the final `gpu-module-to-binary` (so the gpu.module is still readable LLVM/NVVM
+# dialect MLIR, not an opaque binary blob).
+const _GPU_PASSES_NOBIN = GPU_PASSES[1:end-1]
+
+function _codegen_stages(f, full_argtypes; sm="sm_90", feat="+ptx80",
+                         upto::Symbol=:ptx)
+    kname = _sym(f)
+    order = (:sci, :mlir, :lowered, :llvm, :ptx)
+    want = findfirst(==(upto), order)
+    want === nothing && error("code_gpu: unknown level :$upto (one of $order)")
+    out = Dict{Symbol,String}()
+
+    sci, _ = FE.structured(f, full_argtypes)
+    out[:sci] = sprint(show, sci)
+    want == 1 && return out
+
+    mod, _pjt, mlir_ctx, _kinds =
+        MK.lower_to_mlir_gpu(sci, full_argtypes; kernel_name=kname, ctx_arg=2)
+    MK.@with_context mlir_ctx begin
+        out[:mlir] = sprint(show, mod)
+        want == 2 && return out
+        # Lower to LLVM/NVVM dialect (everything but serialise-to-binary).
+        _run_passes!(mod, mlir_ctx, _GPU_PASSES_NOBIN)
+        out[:lowered] = sprint(show, mod)
+        want == 3 && return out
+        # Serialise to gpu.binary, extract bitcode → LLVM IR + PTX.
+        _run_passes!(mod, mlir_ctx, GPU_PASSES[end:end])
+        bc = _extract_gpu_binary(mod)
+        lmod, ptx = _bitcode_to_ptx(bc; sm, feat)
+        out[:llvm] = string(lmod)   # LLVMPrintModuleToString; `show` gives only the wrapper repr
+        want >= 5 && (out[:ptx] = ptx)
+    end
+    return out
 end
 
 # ----------------------------------------------------------------------------
@@ -187,8 +238,12 @@ function _ctx_type(nd::NTuple{D,Int}, wg::NTuple{D,Int}) where {D}
     return KA.CompilerMetadata{ndr, NDI.NoDynamicCheck, Nothing, Nothing, ndobj}
 end
 
-function (obj::KA.Kernel{MLIRCUDABackend})(args...; ndrange=nothing,
-                                                     workgroupsize=nothing)
+# Shared by the launcher and `code_gpu`: resolve geometry + build the inference
+# signature. Infer with HOST array types — the SCI walk only needs each arg's
+# eltype/ndims (→ `memref<?×…×T>`), and inferring a kernel body's `A[i]` on a
+# `CuArray` trips `GPUArrays.assertscalar`. (Marshalling still uses the real
+# device arrays.)
+function _launch_setup(obj::KA.Kernel{MLIRCUDABackend}, args, ndrange, workgroupsize)
     ndrange === nothing && error("MLIRCUDABackend: ndrange must be specified")
     wg = _resolve_wgsize(obj, workgroupsize)
     nd = ndrange isa Integer ? (ndrange,) : Tuple(ndrange)
@@ -198,19 +253,37 @@ function (obj::KA.Kernel{MLIRCUDABackend})(args...; ndrange=nothing,
     all(nd[d] % wg[d] == 0 for d in 1:length(wg)) || error(
         "MLIRCUDABackend: ndrange=$nd not a per-dim multiple of workgroupsize=$wg " *
         "(no tail-block masking yet — __validindex→true).")
-
-    # Infer with HOST array types: the SCI walk only needs each arg's
-    # eltype/ndims (→ `memref<?×…×T>`), and inferring a kernel body's `A[i]` on
-    # a `CuArray` trips `GPUArrays.assertscalar`. The descriptor marshalling
-    # below still uses the real device arrays.
     ctxT = _ctx_type(nd, wg)
     full_argtypes = Tuple{ctxT, map(a -> _host_argtype(typeof(a)), args)...}
-    cufn, kinds = _compile(obj.f, full_argtypes)
+    return full_argtypes, nd, wg
+end
 
+function (obj::KA.Kernel{MLIRCUDABackend})(args...; ndrange=nothing,
+                                                     workgroupsize=nothing)
+    full_argtypes, nd, wg = _launch_setup(obj, args, ndrange, workgroupsize)
+    cufn, kinds = _compile(obj.f, full_argtypes)
     flat, sig = _marshal(args, kinds)
     grid = map(cld, nd, wg)          # blocks per dim
     cudacall(cufn, Tuple{sig...}, flat...; threads=wg, blocks=grid)
     return nothing
+end
+
+# ----------------------------------------------------------------------------
+# code_gpu — reflection entry points (see MLIRKernels.code_gpu docstring).
+# ----------------------------------------------------------------------------
+
+# Low-level form: explicit (gpu_body, full_argtypes::Type).
+function MK.code_gpu(@nospecialize(f), full_argtypes::Type; level::Symbol=:ptx,
+                     sm="sm_90", feat="+ptx80")
+    stages = _codegen_stages(f, full_argtypes; sm, feat, upto=level)
+    return stages[level]
+end
+
+# Ergonomic form: a KA kernel + launch args (mirrors a `(obj)(args…; ndrange)`).
+function MK.code_gpu(obj::KA.Kernel{MLIRCUDABackend}, args...; level::Symbol=:ptx,
+                     ndrange=nothing, workgroupsize=nothing, sm="sm_90", feat="+ptx80")
+    full_argtypes, _nd, _wg = _launch_setup(obj, args, ndrange, workgroupsize)
+    return MK.code_gpu(obj.f, full_argtypes; level, sm, feat)
 end
 
 end # module MLIRCUDAExt
