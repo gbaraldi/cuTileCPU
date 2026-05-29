@@ -54,95 +54,12 @@ struct CPUKernel{F, TT}
     # Per-memref-arg required alignment (parallel to memref entries of
     # param_types). Empty for scalar params.
     param_alignments::Vector{Int}
-    # :cuTile (default — kernels with TileArray args + KernelState seed)
-    # or :spmd  (scalar-typed Julia kernels lifted to vector lanes; no
-    #            alignment check, no seed param, see `spmd_function`).
+    # :spmd (scalar-typed Julia kernels lifted to vector lanes; see
+    # `spmd_function`) or :ka (the KernelAbstractions CPU path). Both use the
+    # seedless SPMD ABI and only check alignment when `param_alignments` is set.
     kind::Symbol
 end
 
-# Compilation cache: (f, tt, n_grid_dims, serial) → CPUKernel. The `serial`
-# bool keys the OpenMP-or-not variant separately so users can keep both
-# compiled.
-const _kernel_cache = Dict{Tuple{Any, Type, Int, Bool}, CPUKernel}()
-
-# Run cuTile's full pipeline and capture the dataflow analyses' results.
-# Mirrors `ct.code_structured(f, argtypes; optimize=true)` but keeps the
-# (divby_info, bounds_info) tuple `run_passes!` returns — `code_structured`
-# discards them. The walker uses them to emit per-stride `llvm.intr.assume`
-# annotations on TileArray kernel args at func entry, which is the alignment
-# proof LLVM's vectorizer needs to widen non-leading-dim accesses.
-function _structured_with_analyses(@nospecialize(f), @nospecialize(argtypes))
-    stripped, const_argtypes = ct.process_const_argtypes(f, argtypes)
-    mi = ct.lookup_method_instance(f, stripped)
-    cache = ct.CacheView{ct.CuTileResults}(:cuTile, Base.get_world_counter())
-    ir, rettype = ct.emit_julia(cache, mi; const_argtypes)
-    sci, rettype, _ = ct.emit_structured(ir, rettype)
-    sci = copy(sci)
-    divby_info, bounds_info = ct.run_passes!(sci)
-    return sci, rettype, divby_info, bounds_info
-end
-
-"""
-    cpu_function(f, argtypes::Tuple{...}; n_grid_dims=1) -> CPUKernel
-
-Compile `f` for the CPU backend. `argtypes` is the tuple of *runtime* argument
-types — exactly what `ct.cufunction` expects after `cuTileconvert`. For host
-adoption convenience this overload also accepts a tuple of *values*:
-
-    cpu_function(vadd, (a, b, c, ct.Constant(16)))
-
-which derives the types via `Core.Typeof` after `cuTileconvert`.
-
-Compilation is cached on `(f, argtypes, n_grid_dims)`.
-"""
-function cpu_function(@nospecialize(f), argtypes::Type;
-                      n_grid_dims::Int=1, kernel_name=string(nameof(f)),
-                      serial::Bool=false)
-    # `serial` toggles the lowering pipeline: false (default) emits OpenMP
-    # parallel-for over the grid; true compiles a single-threaded .so with
-    # `scf.parallel` lowered directly to `scf.for`. Each variant lives in its
-    # own cache entry so users can flip between them without recompilation
-    # blowing away the other.
-    key = (f, argtypes, n_grid_dims, serial)
-    haskey(_kernel_cache, key) && return _kernel_cache[key]::CPUKernel
-
-    sci, rettype, divby_info, bounds_info = _structured_with_analyses(f, argtypes)
-    rettype === Nothing ||
-        error("cpu_function: kernel must return Nothing, got $rettype")
-
-    mod, param_julia_types, mlir_ctx, param_kinds =
-        lower_to_mlir(sci, argtypes; kernel_name, n_grid_dims,
-                      divby_info, bounds_info)
-
-    passes = serial ? SERIAL_PASSES : DEFAULT_PASSES
-    so_path = compile_module_to_so(mod, mlir_ctx; kernel_name, passes)
-    h = Libdl.dlopen(so_path)
-    fn = Libdl.dlsym(h, Symbol("_mlir_ciface_" * kernel_name))
-
-    alignments = Int[]
-    for (i, T) in enumerate(param_julia_types)
-        if param_kinds[i] === :memref
-            push!(alignments, Int(T.parameters[3].alignment))
-        end
-    end
-    k = CPUKernel{typeof(f), argtypes}(f, so_path, h, fn,
-                                       param_julia_types, param_kinds,
-                                       n_grid_dims, alignments, :cuTile)
-    _kernel_cache[key] = k
-    return k
-end
-
-# Tuple-of-values overload: derives argtypes via cuTileconvert.
-function cpu_function(@nospecialize(f), args::Tuple; kwargs...)
-    converted = map(_cpu_convert, args)
-    tt = Tuple{map(Core.Typeof, converted)...}
-    return cpu_function(f, tt; kwargs...)
-end
-
-# Mirror cuTile.KernelAdaptor for host buffers: AbstractArray → TileArray.
-_cpu_convert(x::AbstractArray) = ct.TileArray(x)
-_cpu_convert(t::Type) = ct.Constant(t)
-_cpu_convert(x) = x
 
 """
     (k::CPUKernel)(args...; blocks)
@@ -177,7 +94,6 @@ function (k::CPUKernel)(args...; blocks)
     align_idx = 1
     last_arg_idx = lastindex(args)
     for (ai, a) in enumerate(args)
-        a isa ct.Constant && continue
         # SPMD: drop the trailing scalar (the lane index `i::Int`).
         if is_spmd && a isa Integer && ai == last_arg_idx
             continue
@@ -237,24 +153,11 @@ function (k::CPUKernel)(args...; blocks)
     desired = Cint(min(MAX_THREADS, max(1, n_blocks_total)))
     rescale = desired != MAX_THREADS
     rescale && ccall((:omp_set_num_threads, LIBOMP), Cvoid, (Cint,), desired)
-    # Implicit trailing KernelState.seed: a fresh `rand(UInt32)` per launch so
-    # consecutive launches see distinct seeds. Mirrors cuTile's bytecode
-    # launch (cuTile.jl/src/launch.jl, `_flatten_static!`'s `state.seed`).
-    # Kernels that don't reference `Intrinsics.kernel_state()` get an unused
-    # i32 param — LLVM optimizes it away in the function body but the host
-    # still has to pass it to match the ABI.
-    seed = Base.rand(UInt32)
+    # SPMD/KA ABI: memref descriptors + uniform scalars + grid (no implicit
+    # KernelState seed — those kernels can't access `Intrinsics.kernel_state()`).
     GC.@preserve descs pin_targets begin
-        if is_spmd || is_ka
-            # Same ABI as SPMD: memref descriptors + uniform scalars + grid;
-            # no implicit seed slot (kernels written for the KA / SPMD paths
-            # don't have access to `Intrinsics.kernel_state()`).
-            _ccall_launch_spmd(k.fn, desc_ptrs, Tuple(scalar_vals),
-                               Tuple(scalar_types), grid)
-        else
-            _ccall_launch(k.fn, desc_ptrs, Tuple(scalar_vals),
-                          Tuple(scalar_types), seed, grid)
-        end
+        _ccall_launch_spmd(k.fn, desc_ptrs, Tuple(scalar_vals),
+                           Tuple(scalar_types), grid)
     end
     rescale && ccall((:omp_set_num_threads, LIBOMP), Cvoid, (Cint,), Cint(MAX_THREADS))
     return nothing
@@ -271,124 +174,7 @@ const LIBOMP = libomp_path
 # nthreads for a small launch.
 const MAX_THREADS = Int(ccall((:omp_get_max_threads, libomp_path), Cint, ()))
 
-# Dispatches per (Nm, scalar tuple types, Ng). The generated body emits a
-# static-typed ccall. `scalar_vals` is a heterogeneous Tuple{...} of the
-# scalar arg values and `scalar_types` is a Tuple{Type, Type, ...} of the
-# corresponding ccall types. The two tuples must have equal length.
-# =============================================================================
-# Explicit parallel-for surface
-# =============================================================================
 
-"""
-    parallel_for(f, args; blocks) -> nothing
-
-Launch `f(args...)` with an explicit parallel grid. `blocks` is the grid
-extent — `Int` for a 1-D grid, `NTuple{N,Int}` for higher-rank grids. Compiles
-on first use; subsequent calls with the same `(f, argtypes, n_grid_dims)`
-reuse the cached compilation.
-
-The cuTile-CPU analogue of CUDA's `@cuda blocks=N kernel(args...)`, surfaced
-as an explicit parallel-for: the grid is the foreach, and one ccall per
-launch dispatches all blocks via MLIR's OpenMP lowering. Internally identical
-to `cpu_function(f, args)(args...; blocks=blocks)` — provided here so kernels
-read closer to "for bid in 1:N, run this kernel" than to a CUDA macro.
-
-# Example
-```julia
-n = 1024; tile = 16
-a = aligned_array(Float32, n; alignment=128)
-b = aligned_array(Float32, n; alignment=128)
-c = aligned_array(Float32, n; alignment=128)
-parallel_for(vadd, (a, b, c, ct.Constant(tile)); blocks = n ÷ tile)
-```
-"""
-function parallel_for(@nospecialize(f), args::Tuple; blocks, serial::Bool=false)
-    grid = blocks isa Integer ? (Int(blocks),) : Tuple(Int.(blocks))
-    k = cpu_function(f, args; n_grid_dims=length(grid), serial)
-    return k(args...; blocks=grid)
-end
-
-"""
-    @parallel_for blocks=N  f(args...)
-    @parallel_for blocks=(Nx, Ny[, Nz])  f(args...)
-    @parallel_for blocks=N  serial=true  f(args...)
-
-Macro form of [`parallel_for`](@ref). Trailing argument is the kernel call;
-preceding arguments are `kw=val` settings (`blocks=` is required; `serial=`
-optional). Equivalent to `parallel_for(f, (args...,); blocks=..., serial=...)`.
-
-```julia
-@parallel_for blocks = n ÷ 16              vadd(a, b, c, ct.Constant(16))
-@parallel_for blocks = (M, N)              gemm(a, b, c, ct.Constant(32))
-@parallel_for blocks = n ÷ 16  serial=true vadd(a, b, c, ct.Constant(16))
-```
-"""
-macro parallel_for(macro_args...)
-    isempty(macro_args) &&
-        error("@parallel_for: need at least a kernel call expression")
-    call_expr = macro_args[end]
-    kw_exprs = macro_args[1:end-1]
-
-    Meta.isexpr(call_expr, :call) ||
-        error("@parallel_for: last argument must be a kernel call expression")
-
-    blocks_val = nothing
-    serial_val = false
-    for kw in kw_exprs
-        Meta.isexpr(kw, :(=)) && kw.args[1] isa Symbol ||
-            error("@parallel_for: leading args must be `kw = val`, got $kw")
-        if kw.args[1] === :blocks
-            blocks_val = kw.args[2]
-        elseif kw.args[1] === :serial
-            serial_val = kw.args[2]
-        else
-            error("@parallel_for: unsupported keyword `$(kw.args[1])`")
-        end
-    end
-    blocks_val === nothing && error("@parallel_for: `blocks = …` is required")
-
-    f = call_expr.args[1]
-    args = call_expr.args[2:end]
-    return quote
-        parallel_for($(esc(f)), ($(map(esc, args)...),);
-                     blocks = $(esc(blocks_val)),
-                     serial = $(esc(serial_val)))
-    end
-end
-
-# Dispatches per (Nm, scalar tuple types, Ng). The generated body emits a
-# static-typed ccall. `scalar_vals` is a heterogeneous Tuple{...} of the
-# scalar arg values and `scalar_types` is a Tuple{Type, Type, ...} of the
-# corresponding ccall types. The two tuples must have equal length.
-@generated function _ccall_launch(fn::Ptr{Cvoid},
-                                  descs::NTuple{Nm, Ptr{Int}},
-                                  scalar_vals::Tuple,
-                                  scalar_types::Tuple,
-                                  seed::UInt32,
-                                  grid::NTuple{Ng, Int}) where {Nm, Ng}
-    Ns = length(scalar_vals.parameters)
-    # Build ccall arg type tuple: Ptr{Int} per descriptor, then scalar Julia
-    # types (from scalar_types), then UInt32 for the implicit KernelState
-    # seed, then Int per grid dim.
-    scalar_t_exprs = [:(scalar_types[$i]) for i in 1:Ns]
-    desc_args = [:(descs[$i]) for i in 1:Nm]
-    scalar_args = [:(scalar_vals[$i]) for i in 1:Ns]
-    grid_args = [:(grid[$i]) for i in 1:Ng]
-    # ccall needs a literal tuple of types in its type slot; the actual
-    # element type at each scalar position comes from scalar_types — we splice
-    # them via $(scalar_types[i]) at *runtime* by lifting to a generated
-    # expression. Since scalar_types is itself a Tuple{...}, we can read its
-    # parameters here at @generated time:
-    scalar_t_lits = [scalar_vals.parameters[i] for i in 1:Ns]
-    types_expr = Expr(:tuple,
-                      fill(:(Ptr{Int}), Nm)...,
-                      scalar_t_lits...,
-                      :(UInt32),
-                      fill(:(Int), Ng)...)
-    return quote
-        ccall(fn, Cvoid, $types_expr, $(desc_args...), $(scalar_args...), seed, $(grid_args...))
-    end
-end
 
 # SPMD ccall variant: no `seed` parameter (SPMD kernels don't take the
 # implicit `KernelState.seed`). Otherwise identical layout to `_ccall_launch`.

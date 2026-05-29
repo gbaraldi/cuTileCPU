@@ -1,52 +1,55 @@
 """
     MLIRKernels
 
-CPU backend for cuTile.jl. Takes a cuTile kernel + argtypes, runs cuTile's
-existing inference + structurization pipeline, then lowers the resulting
-StructuredIRCode to MLIR (high-level dialects: `scf`, `arith`, `memref`,
-`vector`, `math`, `func`), runs the standard CPU lowering pipeline via
-`mlir-opt` and `mlir-translate` from `MLIR_jll`, JIT-compiles the result via
-`clang` into a shared object, and exposes a launch entry point.
+An MLIR-based, multi-target kernel compiler for Julia. It infers a plain-Julia
+kernel through a standalone `Frontend` (its own `AbstractInterpreter` +
+`IRStructurizer`, no cuTile), lowers the resulting StructuredIRCode to
+high-level MLIR (`scf`/`arith`/`memref`/`vector`/`math`/`func`/`gpu`), and
+targets two backends:
 
-# Quick start
+  - **CPU** — via `mlir-opt`/`mlir-translate` (`MLIR_jll`) → `clang` → a shared
+    object. Surfaced as `spmd_function` (ISPC-style scalar→vector lanes) and as
+    the KernelAbstractions `MLIRBackend` (`KernelAbstractionsExt`).
+  - **GPU SIMT** — via the `gpu` dialect → NVVM → PTX (LLVM.jl) → `cudacall`.
+    Surfaced as the KernelAbstractions `MLIRCUDABackend` (`MLIRCUDAExt`).
+
+# Quick start (KernelAbstractions)
 
 ```julia
-using cuTile, MLIRKernels
-const ct = cuTile
+using KernelAbstractions, CUDA, MLIRKernels
+const GPU = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRCUDABackend
 
-function vadd(a, b, c, tile_size::Int)
-    pid = ct.bid(1)
-    ta = ct.load(a; index=pid, shape=(tile_size,))
-    tb = ct.load(b; index=pid, shape=(tile_size,))
-    ct.store(c; index=pid, tile=ta + tb)
-    return
+@kernel function vadd!(c, @Const(a), @Const(b))
+    i = @index(Global, Linear)
+    @inbounds c[i] = a[i] + b[i]
 end
 
-# Aligned host buffers (the kernel's TileArray ArraySpec demands alignment
-# > 16 bytes, which plain `Vector{Float32}` doesn't guarantee).
 n = 1024
-a = MLIRKernels.aligned_array(Float32, n)
-b = MLIRKernels.aligned_array(Float32, n)
-c = MLIRKernels.aligned_array(Float32, n)
-copyto!(a, 1:n); copyto!(b, 1:n); fill!(c, 0)
-
-k = MLIRKernels.cpu_function(vadd, (a, b, c, ct.Constant(16)))
-k(a, b, c, ct.Constant(16); blocks=(n ÷ 16,))
-@assert c == a .+ b
+a = CUDA.rand(Float32, n); b = CUDA.rand(Float32, n); c = CUDA.zeros(Float32, n)
+vadd!(GPU(), 256)(c, a, b; ndrange=n); CUDA.synchronize()
+@assert Array(c) ≈ Array(a) .+ Array(b)
 ```
 
 # Reflection
 
 ```julia
-println(MLIRKernels.code_mlir(vadd, (a, b, c, ct.Constant(16))))
-println(MLIRKernels.code_llvm(vadd, (a, b, c, ct.Constant(16))))
+# CPU SPMD path:
+println(code_mlir(spmd_kernel, (Vector{Float32}, Vector{Float32}, Int)))
+# GPU SIMT path — IR at any level (:sci, :mlir, :lowered, :llvm, :ptx):
+println(code_gpu(vadd!(GPU(), 256), c, a, b; ndrange=n, level=:ptx))
 ```
 """
 module MLIRKernels
 
-using cuTile
-const ct = cuTile
-using cuTile: BFloat16
+using BFloat16s: BFloat16
+
+# Local mirrors of the comparison/signedness enums the scalar (SPMD/KA/GPU)
+# lowering uses — formerly taken from cuTile. Member values match cuTile's so
+# the predicate-code lookups are unchanged.
+using EnumX
+@enumx Signedness Unsigned=0 Signed=1
+@enumx ComparisonPredicate Equal=0 NotEqual=1 LessThan=2 LessThanOrEqual=3 GreaterThan=4 GreaterThanOrEqual=5
+@enumx ComparisonOrdering Unordered=0 Ordered=1
 
 using MLIR
 using MLIR.IR
@@ -139,8 +142,7 @@ loaded):
 """
 function code_gpu end
 
-export aligned_array, cpu_function, parallel_for, @parallel_for,
-       spmd_function, ka_function,
+export aligned_array, spmd_function, ka_function,
        code_mlir, code_mlir_lowered, code_llvm, code_gpu
 
 end # module

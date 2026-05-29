@@ -218,72 +218,18 @@ mlir_tile_type(shape::AbstractVector{<:Integer}, T::Type) =
 # Julia tile-element type for a cuTile-style tile Julia type (Tile{T,Shape},
 # IntTile{Shape,T}, FloatTile{Shape,T}, Tile{Bool,Shape}). Returns `nothing` if
 # `T` is not a tile.
-function tile_eltype(@nospecialize(T))
-    T isa DataType || return nothing
-    # cuTile.Tile{T,Shape}, FloatTile, IntTile
-    if T <: ct.Tile
-        return T.parameters[1]
-    end
-    return nothing
-end
 
 # Julia tile-shape tuple for a cuTile tile type. Returns `()` for scalar tiles.
-function tile_shape(@nospecialize(T))
-    T isa DataType || return nothing
-    if T <: ct.Tile
-        S = T.parameters[2]
-        S isa DataType && S <: Tuple || return nothing
-        return S.parameters
-    end
-    return nothing
-end
 
 # MLIR vector type for a cuTile Tile Julia type. For 0-D tiles returns the
 # scalar element type.
-function mlir_type_for_tile(@nospecialize(T))
-    eT = tile_eltype(T)
-    eT === nothing && return nothing
-    shape = tile_shape(T)
-    shape === nothing && return nothing
-    return mlir_tile_type(Tuple(shape), eT)
-end
 
 # Map any cuTile / Julia type to an MLIR type (scalar or vector).
-function mlir_type_for(@nospecialize(T))
-    if T isa DataType && T <: ct.Tile
-        v = mlir_type_for_tile(T)
-        v === nothing || return v
-    end
-    T isa Type && T <: Number && return mlir_elem_type(T)
-    error("MLIRKernels: cannot map type $T to MLIR")
-end
 
 # TileArray{T,N,Spec()} → memref<?x?xT, strided<[…]>>. When `spec.contiguous`,
 # encode unit stride on the innermost (col-major) dim — gives LLVM a
 # compile-time proof of contiguous access.
-function mlir_memref_for_tilearray(TA::Type)
-    @assert TA <: ct.TileArray "expected TileArray, got $TA"
-    eT = ct.eltype(TA)
-    N  = ndims(TA)
-    spec = TA.parameters[3]  # ArraySpec singleton instance
-    elem = mlir_elem_type(eT)
-    shape = fill(Int(IR.dynsize()), N)
-    layout = if spec.contiguous
-        # Julia col-major: dim 1 fastest. MLIR memref row-major: last dim fastest.
-        # So Julia dim 1 maps to MLIR dim N. Unit stride goes there; rest dynamic.
-        strides_mlir = Vector{String}(undef, N)
-        for k in 1:N
-            mlir_dim = N - k + 1
-            strides_mlir[mlir_dim] = (k == 1) ? "1" : "?"
-        end
-        parse(IR.Attribute, "strided<[" * join(strides_mlir, ", ") * "]>")
-    else
-        IR.Attribute()
-    end
-    return IR.MemRefType(elem, shape, layout, IR.Attribute()), spec
-end
 
-spec_alignment(spec) = Int(spec.alignment)
 
 # ----------------------------------------------------------------------------
 # Divisibility annotations on TileArray kernel args
@@ -305,288 +251,12 @@ spec_alignment(spec) = Int(spec.alignment)
 # dataflow results are queried at consumer sites, not at entry. This matches
 # what cuTile's `apply_arg_assume_predicates!` does for the bytecode target.
 
-"""
-    emit_llvm_intr_assume!(cond)
 
-Emit `llvm.intr.assume %cond` (no result, side-effecting). Reactant's
-`Dialects.llvm` binding doesn't yet wrap the intrinsic, so we go through
-`create_operation` directly.
-"""
-function emit_llvm_intr_assume!(cond::IR.Value)
-    # llvm.intr.assume takes the condition followed by zero or more op-bundle
-    # operands. The empty-bundle case still requires the `op_bundle_sizes`
-    # DenseI32 array attribute and an `operandSegmentSizes` of [1, 0]
-    # (cond, no bundle operands).
-    obs = parse(IR.Attribute, "array<i32>")
-    opseg = Dialects.operandsegmentsizes([1, 0])
-    IR.create_operation(
-        "llvm.intr.assume",
-        IR.Location();
-        operands  = IR.Value[cond],
-        owned_regions = IR.Region[],
-        successors = IR.Block[],
-        attributes = IR.NamedAttribute[
-            IR.NamedAttribute("op_bundle_sizes", obs),
-            opseg,
-        ],
-        results   = IR.Type[],
-        result_inference = false,
-    )
-    return nothing
-end
-
-"""
-    emit_stride_divby_assumes!(memref_val, argT, N) -> Int
-
-Emit `llvm.intr.assume((stride % n) == 0)` for each non-leading stride dim
-of a TileArray-typed memref operand whose `arg_chain(argT, [3, i])` yields
-a `DivBy(n)` with `n > 1`. `N` is the memref's rank.
-
-Returns the number of stride dims annotated (for reporting / test
-introspection). Quiet when no spec divisibility info applies.
-
-Note: arg path `[3, i]` indexes strides in Julia order (dim 1 = fastest,
-contiguous). MLIR memref strides are returned in row-major order
-(dim 0 = slowest), so Julia stride dim `i` is MLIR stride dim `N - i + 1`.
-"""
-function emit_stride_divby_assumes!(memref_val::IR.Value, argT::Type, N::Int)
-    argT <: ct.TileArray || return 0
-
-    # Determine which (Julia-dim) stride paths carry a non-trivial DivBy.
-    # `arg_chain` returns Vector{AssumePredicate}; we project to the DivBy
-    # divisor (n > 1) and drop chains that only carry Bounded predicates
-    # (Bounded on a stride doesn't help the vectorizer).
-    divisors = Int[]
-    julia_dims = Int[]
-    for i in 1:N
-        chain = ct.arg_chain(argT, Int[3, i])
-        d = 1
-        for p in chain
-            if p isa ct.DivBy
-                d = max(d, p.divisor)
-            end
-        end
-        if d > 1
-            push!(divisors, d)
-            push!(julia_dims, i)
-        end
-    end
-    isempty(divisors) && return 0
-
-    # Result types for memref.extract_strided_metadata. base_buffer is a
-    # rank-0 memref<elemT>; offset / sizes / strides are `index`.
-    idx_t = IR.IndexType()
-    elem_t = mlir_elem_type(ct.eltype(argT))
-    base_t = IR.MemRefType(elem_t, Int[], IR.Attribute(), IR.Attribute())
-    sizes_t = IR.Type[idx_t for _ in 1:N]
-    strides_t = IR.Type[idx_t for _ in 1:N]
-
-    md_op = _memref.extract_strided_metadata(
-        memref_val;
-        base_buffer = base_t,
-        offset = idx_t,
-        sizes = sizes_t,
-        strides = strides_t,
-    )
-    # Result layout: [base_buffer, offset, sizes..., strides...]
-    base_off = 0
-    offset_off = 1
-    sizes_off = 2
-    strides_off = 2 + N
-
-    # arith.cmpi predicate `eq` is i64 code 0.
-    eq_attr = IR.Attribute(0, IR.Type(Int64))
-
-    count = 0
-    for (k, n) in zip(julia_dims, divisors)
-        # Julia dim k → MLIR dim (N - k + 1), 1-based; → 0-based result idx.
-        mlir_dim = N - k + 1
-        stride_val = IR.result(md_op, strides_off + mlir_dim)
-        c_n  = IR.result(_arith.constant(; value = IR.Attribute(Int(n), idx_t)))
-        c_0  = IR.result(_arith.constant(; value = IR.Attribute(Int(0), idx_t)))
-        rem_ = IR.result(_arith.remui(stride_val, c_n))
-        cond = IR.result(_arith.cmpi(rem_, c_0; predicate = eq_attr))
-        emit_llvm_intr_assume!(cond)
-        count += 1
-    end
-    return count
-end
 
 # ----------------------------------------------------------------------------
 # Top-level entry: lower one SCI to an MLIR module
 # ----------------------------------------------------------------------------
 
-"""
-    lower_to_mlir(sci, argtypes; kernel_name, n_grid_dims=1)
-        -> (IR.Module, param_julia_types::Vector{Type}, IR.Context)
-
-Walks `sci` and produces an MLIR module containing
-`func.func @<kernel_name>` ready for the standard CPU lowering pipeline.
-
-`argtypes` should be the tuple type originally handed to `ct.code_structured`.
-`Const`-seeded slots in `sci.argtypes` contribute no func parameter — their
-value is inlined wherever referenced.
-
-Returns the module, the Julia types of the corresponding func parameters
-(for host descriptor packing), and the MLIR context (kept alive so the module
-remains valid).
-"""
-function lower_to_mlir(sci::StructuredIRCode, argtypes::Type;
-                       kernel_name::String, n_grid_dims::Int=1,
-                       divby_info=nothing, bounds_info=nothing)
-    ctx = fresh_context()
-    mod_ref = Ref{IR.Module}()
-    param_julia_types = Type[]
-    param_kinds = Symbol[]   # parallel to param_julia_types: :memref or :scalar
-
-    @with_context ctx begin
-        IR.load_all_available_dialects()
-        mod = IR.Module(IR.Location())
-        mod_ref[] = mod
-
-        @with_module mod begin
-            lc = LowerCtx(ctx, mod)
-
-            idx_t = IR.IndexType()
-            param_mlir_types = IR.Type[]
-            # Each entry: (slot, kind, [spec])
-            param_arg_slots = Int[]
-            param_specs = Any[]     # parallel; only meaningful for :memref slots
-
-            for (i, AT) in enumerate(sci.argtypes)
-                i == 1 && continue
-                if AT isa Core.Const
-                    lc.arg_const[i] = AT.val
-                    continue
-                end
-                AT_wide = widenconst(AT)
-                if AT_wide <: ct.TileArray
-                    mr, spec = mlir_memref_for_tilearray(AT_wide)
-                    push!(param_mlir_types, mr)
-                    push!(param_arg_slots, i)
-                    push!(param_julia_types, AT_wide)
-                    push!(param_kinds, :memref)
-                    push!(param_specs, spec)
-                    lc.arg_elem_types[i] = ct.eltype(AT_wide)
-                elseif AT_wide <: Number
-                    push!(param_mlir_types, mlir_elem_type(AT_wide))
-                    push!(param_arg_slots, i)
-                    push!(param_julia_types, AT_wide)
-                    push!(param_kinds, :scalar)
-                    push!(param_specs, nothing)
-                else
-                    error("MLIRKernels: unsupported arg type $AT_wide at slot $i")
-                end
-            end
-
-            # Trailing implicit `KernelState.seed` parameter (i32). Always
-            # emitted, regardless of whether the kernel actually uses RNG —
-            # mirrors cuTile's bytecode codegen, which puts the `KernelState`
-            # flat params right after the user args. LLVM's IPO drops it for
-            # kernels that don't reference `Intrinsics.kernel_state()`. The
-            # host-side launch always passes a fresh `rand(UInt32)` here, so
-            # consecutive launches see distinct seeds.
-            seed_param_idx = length(param_mlir_types) + 1
-            push!(param_mlir_types, mlir_elem_type(UInt32))
-
-            grid_param_offset = length(param_mlir_types)
-            for _ in 1:n_grid_dims
-                push!(param_mlir_types, idx_t)
-            end
-
-            ftype = IR.FunctionType(param_mlir_types, IR.Type[])
-            arg_locs = [IR.Location() for _ in 1:length(param_mlir_types)]
-            entry = IR.Block(param_mlir_types, arg_locs)
-            body_region = IR.Region()
-            push!(body_region, entry)
-
-            funcop = _func.func_(;
-                sym_name      = IR.Attribute(kernel_name),
-                function_type = IR.Attribute(ftype),
-                body          = body_region,
-            )
-            IR.setattr!(funcop, "llvm.emit_c_interface", IR.UnitAttribute())
-            push!(IR.body(mod), funcop)
-
-            raw_arg_vals = Dict{Int, IR.Value}()
-            for (k, slot) in enumerate(param_arg_slots)
-                raw_arg_vals[slot] = IR.argument(entry, k)
-            end
-            # Bind the implicit `KernelState.seed` param. `Intrinsics.kernel_state()`
-            # and the subsequent `getfield(_, :seed)` chain resolves to this Value.
-            lc.seed_param = IR.argument(entry, seed_param_idx)
-            grid_vals = IR.Value[IR.argument(entry, grid_param_offset + d)
-                                 for d in 1:n_grid_dims]
-
-            @with_block entry begin
-                c0 = IR.result(_arith.constant(; value=IR.Attribute(Int(0), idx_t)))
-                c1 = IR.result(_arith.constant(; value=IR.Attribute(Int(1), idx_t)))
-
-                # Memref args: propagate ArraySpec.alignment via
-                # memref.assume_alignment. Scalar args: bind directly.
-                for (k, slot) in enumerate(param_arg_slots)
-                    if param_kinds[k] === :memref
-                        align = spec_alignment(param_specs[k])
-                        align_attr = IR.Attribute(align, IR.Type(Int32))
-                        # `memref.assume_alignment` is a side-effecting op
-                        # with no result on MLIR 18 (the result-returning
-                        # form was added in MLIR 21). Emit the assume and
-                        # keep using the raw arg Value.
-                        _memref.assume_alignment(
-                            raw_arg_vals[slot]; alignment=align_attr,
-                        )
-                        lc.arg_vals[slot] = raw_arg_vals[slot]
-                        # Per-stride divisibility annotations. Plays the
-                        # role of cuTile's `apply_arg_assume_predicates!`
-                        # for the bytecode target: gives the vectorizer
-                        # an alignment proof for non-leading dims (the
-                        # leading dim is already covered by the strided
-                        # `<[1, …]>` layout). `divby_info` / `bounds_info`
-                        # carry the consumer-side dataflow facts; they're
-                        # accepted by `lower_to_mlir` for future use but
-                        # the entry-time chain is spec-only via
-                        # `arg_chain`.
-                        argT = widenconst(sci.argtypes[slot])
-                        N = ndims(argT)
-                        emit_stride_divby_assumes!(raw_arg_vals[slot], argT, N)
-                    else
-                        lc.arg_vals[slot] = raw_arg_vals[slot]
-                    end
-                end
-
-                # Pre-cast grid extents to i32 for use by
-                # `Intrinsics.get_num_tile_blocks` (cuTile types these as Int32).
-                for gv in grid_vals
-                    push!(lc.grid_extents_i32,
-                          IR.result(_arith.index_cast(gv; out=IR.Type(Int32))))
-                end
-
-                par_region = IR.Region()
-                par_block = IR.Block([idx_t for _ in 1:n_grid_dims],
-                                     [IR.Location() for _ in 1:n_grid_dims])
-                push!(par_region, par_block)
-                _scf.parallel(
-                    IR.Value[c0 for _ in 1:n_grid_dims],
-                    grid_vals,
-                    IR.Value[c1 for _ in 1:n_grid_dims],
-                    IR.Value[];
-                    results=IR.Type[], region=par_region,
-                )
-
-                @with_block par_block begin
-                    for d in 1:n_grid_dims
-                        push!(lc.bids, IR.argument(par_block, d))
-                    end
-                    walk_block!(lc, sci.entry)
-                    _scf.reduce(IR.Value[]; reductions=IR.Region[])
-                end
-
-                _func.return_(IR.Value[])
-            end
-        end
-    end
-    return (mod_ref[], param_julia_types, ctx, param_kinds)
-end
 
 # ----------------------------------------------------------------------------
 # SPMD mode: lower a scalar-typed Julia kernel to vector MLIR
@@ -1265,17 +935,6 @@ function walk_stmt!(lc::LowerCtx, idx::Int, @nospecialize(stmt), @nospecialize(t
         return walk_expr!(lc, idx, stmt, typ)
     elseif stmt isa Core.ReturnNode
         return nothing
-    elseif stmt isa cuTile.MakeTokenNode
-        # No memory ordering on CPU MVP; tokens are dropped. Consumers ignore
-        # the token operand.
-        return nothing
-    elseif stmt isa cuTile.TokenResultNode
-        # Memory-op result token; no SSA Value needed (the CPU path doesn't
-        # thread tokens through). Drop.
-        return nothing
-    elseif stmt isa cuTile.JoinTokensNode
-        # Token merge for ordering; not modelled on the CPU path. Drop.
-        return nothing
     elseif stmt isa IfOp
         emit_if!(lc, idx, stmt, typ)
         return nothing
@@ -1428,16 +1087,7 @@ function resolve_value_or_const(lc::LowerCtx, @nospecialize(op))
 end
 
 function undef_value(lc::LowerCtx, @nospecialize(T))
-    if T isa DataType && T <: ct.Tile
-        eT = tile_eltype(T)
-        sh = Tuple(tile_shape(T))
-        if isempty(sh)
-            return materialise_zero_scalar(eT)
-        end
-        vec_t = mlir_tile_type(sh, eT)
-        splat = _splat_attr(zero(eT), vec_t)
-        return IR.result(_arith.constant(; value=splat, result=vec_t))
-    elseif T isa Type && T <: Number
+    if T isa Type && T <: Number
         return materialise_zero_scalar(T)
     end
     error("undef_value: unsupported type $T")
@@ -1462,22 +1112,6 @@ function materialise_const(lc::LowerCtx, @nospecialize(c))
     error("materialise_const: cannot materialise $c::$(typeof(c))")
 end
 
-# Resolve a load_/store_partition_view index-tuple argument. Inference may
-# leave this either as
-#   • an SSAValue referring to a `tuple(...)` call we tracked in `lc.tuples`, or
-#   • a literal Julia Tuple{...} (when every index folded to a constant — e.g.
-#     `ct.load(K; index=(1, 1), ...)` becomes `(0, 0)` after the 1-based-to-
-#     0-based normalisation).
-# Returns a Vector{Any} ready to feed `emit_tile_load!`/`emit_tile_store!`.
-function _resolve_index_tuple(lc::LowerCtx, idx_arg, errmsg::String)
-    if idx_arg isa SSAValue
-        haskey(lc.tuples, idx_arg.id) || error(errmsg)
-        return lc.tuples[idx_arg.id]
-    elseif idx_arg isa Tuple
-        return collect(Any, idx_arg)
-    end
-    error(errmsg)
-end
 
 function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
                     args::Vector{Any}, @nospecialize(typ))
@@ -1509,50 +1143,6 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
         # Tile-load index ops re-cast back via `cast_to_index`.
         bid_idx = lc.bids[ax + 1]
         return IR.result(_arith.index_cast(bid_idx; out=i32_t))
-
-    elseif fname === :make_tensor_view
-        # args = [TileArrayType, ptr_getfield, sizes_getfield, strides_getfield]
-        # The source arg is recovered from the ptr getfield's tracked refs.
-        ptr_arg = args[2]
-        ptr_arg isa SSAValue && haskey(lc.field_refs, ptr_arg.id) ||
-            error("make_tensor_view: cannot resolve source from ptr operand $ptr_arg")
-        src_arg = lc.field_refs[ptr_arg.id][1]
-        memref_val = lc.arg_vals[src_arg]
-        elem_type = lc.arg_elem_types[src_arg]
-        lc.tensor_views[idx] = TensorViewInfo(memref_val, elem_type)
-        return nothing
-
-    elseif fname === :make_partition_view
-        # args = [TensorView, tile_shape_tuple, padding_mode, ...]
-        src_view = args[1]
-        src_view isa SSAValue ||
-            error("make_partition_view: expected SSAValue source, got $src_view")
-        tv = lc.tensor_views[src_view.id]
-        tile_shape = something(resolve_const(lc, args[2]), args[2])
-        tile_shape isa Tuple ||
-            error("make_partition_view: tile shape must be const tuple, got $tile_shape")
-        lc.partitions[idx] = PartitionInfo(tv.base, Int[tile_shape...], tv.elem_type)
-        return nothing
-
-    elseif fname === :load_partition_view
-        part_ssa = args[1]
-        part_ssa isa SSAValue || error("load_partition_view: bad partition operand")
-        part = lc.partitions[part_ssa.id]
-        components = _resolve_index_tuple(lc, args[4],
-                                          "load_partition_view: bad index-tuple operand")
-        return emit_tile_load!(lc, part, components)
-
-    elseif fname === :store_partition_view
-        part_ssa = args[1]
-        part_ssa isa SSAValue || error("store_partition_view: bad partition operand")
-        part = lc.partitions[part_ssa.id]
-        val_v = resolve_value(lc, args[2])
-        val_v !== nothing ||
-            error("store_partition_view: cannot resolve value to store")
-        components = _resolve_index_tuple(lc, args[5],
-                                          "store_partition_view: bad index-tuple operand")
-        emit_tile_store!(lc, part, val_v, components)
-        return nothing
 
     elseif fname === :addf
         return emit_binop_value!(lc, args, _arith.addf)
@@ -1623,18 +1213,6 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
     elseif fname === :minf
         return emit_binop_value!(lc, args, _arith.minnumf)
 
-    elseif fname === :maxi
-        # Intrinsics.maxi(a, b, signedness) — signed/unsigned int max.
-        return emit_maxmin_int!(lc, args, _arith.maxsi, _arith.maxui)
-
-    elseif fname === :mini
-        return emit_maxmin_int!(lc, args, _arith.minsi, _arith.minui)
-
-    elseif fname === :fma
-        # Intrinsics.fma(x, y, z) — fused multiply-add x*y + z. Same shape on
-        # all three operands.
-        return emit_fma!(lc, args, typ)
-
     elseif fname === :addi
         return emit_binop_value!(lc, args, _arith.addi)
 
@@ -1653,112 +1231,15 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
     elseif fname === :andi
         return emit_binop_value!(lc, args, _arith.andi)
 
-    elseif fname === :mulhii
-        # cuTile Intrinsics.mulhii(a, b) — high-32 bits of the unsigned-widened
-        # product. Use `arith.muli` with overflow=nuw on the extui-widened
-        # operands and shift right by the operand bit width. (MLIR has no
-        # direct mulhii op for vectors; this lowers to LLVM's `llvm.mulhi`
-        # equivalent in practice.)
-        return emit_mulhii!(lc, args, typ)
-
     elseif fname === :shli
         # cuTile Intrinsics.shli(a, b) — logical left shift.
         return emit_binop_value!(lc, args, _arith.shli)
-
-    elseif fname === :shri
-        # cuTile Intrinsics.shri(a, b, signedness) — logical/arithmetic right
-        # shift. Signedness picks shrui vs shrsi.
-        return emit_shri!(lc, args, typ)
-
-    elseif fname === :trunci
-        # cuTile Intrinsics.trunci(x, T) — truncate to narrower integer T.
-        return emit_trunci!(lc, args, typ)
-
-    elseif fname === :itof
-        # cuTile Intrinsics.itof(x, F, signedness) — int → float convert.
-        return emit_itof!(lc, args, typ)
-
-    elseif fname === :negf
-        # cuTile Intrinsics.negf(x) — floating-point negate. Lowers to
-        # `arith.negf`.
-        return emit_negf!(lc, args, typ)
-
-    elseif fname === :cat
-        # cuTile Intrinsics.cat((lhs, rhs), axis::Int) — concatenate two tiles
-        # along `axis`. Lowers to `vector.shuffle` (1-D) or
-        # `vector.insert_strided_slice` (N-D).
-        return emit_cat!(lc, args, typ)
-
-    elseif fname === :extract
-        # cuTile Intrinsics.extract(tile, index, shape) — extract a non-
-        # overlapping subtile. `index` is 0-indexed (1-based ct.extract was
-        # decremented in the frontend); `shape` is the output tile shape, both
-        # in Julia col-major order. Lowers to `vector.extract_strided_slice`.
-        return emit_extract!(lc, args, typ)
-
-    elseif fname === :get_num_tile_blocks
-        # cuTile Intrinsics.get_num_tile_blocks(axis) — grid extent along axis.
-        # `axis` is 0-indexed. For grid dims we have, return the i32 cast of
-        # the runtime grid-extent arg. For axes beyond `n_grid_dims` (e.g. the
-        # RNG-key code unconditionally reads axes 0..1), return 1.
-        return emit_num_tile_blocks!(lc, args, typ)
 
     elseif fname === :cmpi
         return emit_cmpi!(lc, args, typ)
 
     elseif fname === :cmpf
         return emit_cmpf!(lc, args, typ)
-
-    elseif fname === :exti
-        return emit_exti!(lc, args, typ)
-
-    elseif fname === :cldi
-        return emit_cldi!(lc, args, typ)
-
-    elseif fname === :remi
-        return emit_remi!(lc, args, typ)
-
-    elseif fname === :fldi
-        return emit_fldi!(lc, args, typ)
-
-    elseif fname === :mma
-        return emit_mma!(lc, args, typ)
-
-    elseif fname === :broadcast
-        return emit_broadcast!(lc, args, typ)
-
-    elseif fname === :reshape
-        return emit_reshape!(lc, args, typ)
-
-    elseif fname === :permute
-        return emit_permute!(lc, args, typ)
-
-    elseif fname === :constant
-        return emit_intr_constant!(lc, args, typ)
-
-    elseif fname === :reduce
-        return emit_reduce!(lc, idx, args, typ)
-
-    elseif fname === :iota
-        return emit_iota!(lc, args, typ)
-
-    elseif fname === :bitcast && !lc.spmd
-        # cuTile's bitcast intrinsic is (value, type)-ordered. Raw Julia
-        # `Base.bitcast(T, x)` is (type, value) and is handled by the
-        # _RAW_CORE_INTRINSICS path below (which swaps) — so on the SPMD/GPU
-        # path fall through to it rather than mis-ordering the operands.
-        return emit_bitcast!(lc, args, typ)
-
-    elseif fname === :offset
-        emit_offset!(lc, idx, args, typ)
-        return nothing
-
-    elseif fname === :load_ptr_tko
-        return emit_gather!(lc, args, typ)
-
-    elseif fname === :store_ptr_tko
-        emit_scatter!(lc, args, typ)
-        return nothing
 
     elseif fname === :tuple
         lc.tuples[idx] = collect(args)
@@ -1767,31 +1248,6 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
     elseif fname === :getfield
         return emit_getfield!(lc, idx, args, typ)
 
-    elseif fname === :atomic_add
-        return emit_atomic_rmw!(lc, args, typ, :add)
-
-    elseif fname === :atomic_max
-        return emit_atomic_rmw!(lc, args, typ, :max)
-
-    elseif fname === :atomic_min
-        return emit_atomic_rmw!(lc, args, typ, :min)
-
-    elseif fname === :atomic_and
-        return emit_atomic_rmw!(lc, args, typ, :and)
-
-    elseif fname === :atomic_or
-        return emit_atomic_rmw!(lc, args, typ, :or)
-
-    elseif fname === :atomic_xor
-        # Upstream `memref.atomic_rmw` enum has no `xori` kind — route through
-        # the generic-RMW path with an `arith.xori` body.
-        return emit_atomic_rmw_generic!(lc, args, typ, :xor)
-
-    elseif fname === :atomic_xchg
-        return emit_atomic_rmw!(lc, args, typ, :xchg)
-
-    elseif fname === :atomic_cas
-        return emit_atomic_cas!(lc, args, typ)
     end
 
     # ----- SPMD-mode dispatch for plain Julia callees -----
@@ -2029,8 +1485,8 @@ function _allones_of_elem(t)
 end
 
 function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecialize(typ))
-    CP = ct.ComparisonPredicate
-    SG = ct.Signedness
+    CP = ComparisonPredicate
+    SG = Signedness
     # Float / int arithmetic — operand-inferred result, vector-harmonised.
     name === :add_float && return emit_binop_value!(lc, args, _arith.addf)
     name === :sub_float && return emit_binop_value!(lc, args, _arith.subf)
@@ -2078,7 +1534,7 @@ function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecializ
     name === :lt_float && return emit_cmpf!(lc, Any[args[1], args[2], CP.LessThan], typ)
     name === :le_float && return emit_cmpf!(lc, Any[args[1], args[2], CP.LessThanOrEqual], typ)
     name === :eq_float && return emit_cmpf!(lc, Any[args[1], args[2], CP.Equal], typ)
-    name === :ne_float && return emit_cmpf!(lc, Any[args[1], args[2], CP.NotEqual, ct.ComparisonOrdering.Unordered], typ)
+    name === :ne_float && return emit_cmpf!(lc, Any[args[1], args[2], CP.NotEqual, ComparisonOrdering.Unordered], typ)
     # Width / type conversions. Raw arg order is (to_type, value).
     if name === :sext_int || name === :zext_int || name === :trunc_int ||
        name === :sitofp || name === :fptosi
@@ -2180,268 +1636,35 @@ end
 # Implemented as: widen both operands by `extui` to 2W bits, multiply with
 # nuw, shift right by W, then truncate back to W. On vector operands the
 # arith ops broadcast naturally.
-function emit_mulhii!(lc::LowerCtx, args, @nospecialize(typ))
-    a = resolve_value_or_const(lc, args[1])
-    b = resolve_value_or_const(lc, args[2])
-    (a === nothing || b === nothing) &&
-        error("mulhii: unresolved operands ($(args[1]), $(args[2]))")
-    t_in = IR.type(a)
-    # Determine the input element bit width.
-    elem_t = IR.isvector(t_in) ? eltype(t_in) : t_in
-    elem_bits = if elem_t == IR.Type(Int32)
-        32
-    elseif elem_t == IR.Type(Int64)
-        64
-    elseif elem_t == IR.Type(Int16)
-        16
-    elseif elem_t == IR.Type(Int8)
-        8
-    else
-        error("mulhii: unsupported element type $elem_t")
-    end
-    # Widened types.
-    wide_elem = if elem_bits == 32
-        IR.Type(Int64)
-    elseif elem_bits == 16
-        IR.Type(Int32)
-    elseif elem_bits == 8
-        IR.Type(Int16)
-    else
-        error("mulhii: unsupported elem bits $elem_bits")
-    end
-    wide_t = if IR.isvector(t_in)
-        IR.VectorType(ndims(t_in), [Int(size(t_in, i)) for i in 1:ndims(t_in)], wide_elem)
-    else
-        wide_elem
-    end
-    a_wide = IR.result(_arith.extui(a; out=wide_t))
-    b_wide = IR.result(_arith.extui(b; out=wide_t))
-    prod = IR.result(_arith.muli(a_wide, b_wide))
-    shift_const_val = if IR.isvector(t_in)
-        n = prod_shape = ndims(t_in)
-        # Splat shift constant.
-        sh = wide_elem == IR.Type(Int64) ? Int64(elem_bits) :
-             wide_elem == IR.Type(Int32) ? Int32(elem_bits) :
-             Int16(elem_bits)
-        IR.result(_arith.constant(; value=_splat_attr(sh, wide_t), result=wide_t))
-    else
-        sh = wide_elem == IR.Type(Int64) ? Int64(elem_bits) :
-             wide_elem == IR.Type(Int32) ? Int32(elem_bits) :
-             Int16(elem_bits)
-        IR.result(_arith.constant(; value=IR.Attribute(sh)))
-    end
-    shifted = IR.result(_arith.shrui(prod, shift_const_val))
-    return IR.result(_arith.trunci(shifted; out=t_in))
-end
 
 # cuTile Intrinsics.shri(a, b, signedness) — arithmetic / logical right shift.
-function emit_shri!(lc::LowerCtx, args, @nospecialize(typ))
-    a = resolve_value_or_const(lc, args[1])
-    b = resolve_value_or_const(lc, args[2])
-    (a === nothing || b === nothing) &&
-        error("shri: unresolved operands ($(args[1]), $(args[2]))")
-    signed = length(args) >= 3 ?
-             something(resolve_const(lc, args[3]), args[3]) :
-             ct.Signedness.Signed
-    if signed === ct.Signedness.Unsigned
-        return IR.result(_arith.shrui(a, b))
-    else
-        return IR.result(_arith.shrsi(a, b))
-    end
-end
 
 # cuTile Intrinsics.trunci(x, T) — narrow integer cast to type T.
-function emit_trunci!(lc::LowerCtx, args, @nospecialize(typ))
-    v = resolve_value_or_const(lc, args[1])
-    v === nothing && error("trunci: unresolved operand $(args[1])")
-    target_T = something(resolve_const(lc, args[2]), args[2])
-    target_T isa Type || error("trunci: target type must be a Type, got $target_T")
-    out_t = if typ isa DataType && typ <: ct.Tile
-        mlir_type_for_tile(typ)
-    else
-        mlir_elem_type(target_T)
-    end
-    # Identity if MLIR types match (signless).
-    IR.type(v) == out_t && return v
-    return IR.result(_arith.trunci(v; out=out_t))
-end
 
 # cuTile Intrinsics.itof(x, F, signedness) — int → float convert.
-function emit_itof!(lc::LowerCtx, args, @nospecialize(typ))
-    v = resolve_value_or_const(lc, args[1])
-    v === nothing && error("itof: unresolved operand $(args[1])")
-    target_T = something(resolve_const(lc, args[2]), args[2])
-    target_T isa Type || error("itof: target type must be a Type, got $target_T")
-    signed = length(args) >= 3 ?
-             something(resolve_const(lc, args[3]), args[3]) :
-             ct.Signedness.Signed
-    out_t = if typ isa DataType && typ <: ct.Tile
-        mlir_type_for_tile(typ)
-    else
-        mlir_elem_type(target_T)
-    end
-    if signed === ct.Signedness.Unsigned
-        return IR.result(_arith.uitofp(v; out=out_t))
-    else
-        return IR.result(_arith.sitofp(v; out=out_t))
-    end
-end
 
 # cuTile Intrinsics.negf(x) → arith.negf. Result type matches operand.
-function emit_negf!(lc::LowerCtx, args, @nospecialize(typ))
-    v = resolve_value_or_const(lc, args[1])
-    v === nothing && error("negf: unresolved operand $(args[1])")
-    return IR.result(_arith.negf(v))
-end
 
 # cuTile Intrinsics.cat((lhs, rhs), axis::Int) — concatenate two tiles along
 # `axis` (0-indexed Julia col-major). For 1-D tiles, lowers to `vector.shuffle`
 # with the identity-then-shifted lane permutation. For N-D tiles, lowers via
 # two `vector.insert_strided_slice` ops into a zero-initialised result.
-function emit_cat!(lc::LowerCtx, args, @nospecialize(typ))
-    tiles_ref = args[1]
-    tile_refs = if tiles_ref isa SSAValue
-        haskey(lc.tuples, tiles_ref.id) ||
-            error("cat: tiles tuple must be a tuple SSA, got $tiles_ref")
-        lc.tuples[tiles_ref.id]
-    elseif tiles_ref isa Tuple
-        collect(tiles_ref)
-    else
-        error("cat: tiles operand must be a tuple, got $tiles_ref")
-    end
-    length(tile_refs) == 2 || error("cat: only 2-tile cat supported, got $(length(tile_refs))")
-    lhs = resolve_value_or_const(lc, tile_refs[1])
-    rhs = resolve_value_or_const(lc, tile_refs[2])
-    (lhs === nothing || rhs === nothing) &&
-        error("cat: unresolved operand tiles")
-    axis = something(resolve_const(lc, args[2]), args[2])
-    axis isa Integer || error("cat: axis must be const int, got $axis")
-    julia_axis = Int(axis)  # 0-indexed Julia
-
-    # Output type.
-    out_t = mlir_type_for(typ)
-    @assert IR.isvector(out_t) "cat: result must be a vector type"
-    out_rank = ndims(out_t)
-    # MLIR (row-major) axis: Julia col-major axis k → MLIR axis N-1-k.
-    mlir_axis = out_rank - 1 - julia_axis
-
-    if out_rank == 1
-        # vector.shuffle: permutation 0..n_lhs-1 then n_lhs..n_lhs+n_rhs-1.
-        lhs_t = IR.type(lhs)
-        rhs_t = IR.type(rhs)
-        n_lhs = Int(size(lhs_t, 1))
-        n_rhs = Int(size(rhs_t, 1))
-        mask = Int64[i for i in 0:(n_lhs + n_rhs - 1)]
-        return IR.result(_vector.shuffle(lhs, rhs;
-            vector=out_t,
-            mask=IR.DenseArrayAttribute(mask)))
-    end
-
-    # N-D path: insert lhs at offset 0 along `mlir_axis`, then rhs at offset
-    # `size(lhs, mlir_axis)`.
-    lhs_t = IR.type(lhs)
-    rhs_t = IR.type(rhs)
-    elem_t = eltype(out_t)
-    # Start with a zero-splat result and use two insert_strided_slice ops.
-    out_shape = [Int(size(out_t, i)) for i in 1:out_rank]
-    zero_attr = _splat_attr(zero(tile_eltype(typ)), out_t)
-    base = IR.result(_arith.constant(; value=zero_attr, result=out_t))
-
-    lhs_offsets = Int64[i == mlir_axis ? 0 : 0 for i in 0:(out_rank - 1)]
-    lhs_strides = Int64[1 for _ in 0:(ndims(lhs_t) - 1)]
-    base1 = IR.result(_vector.insert_strided_slice(lhs, base;
-        res=out_t,
-        offsets=_i64_array_attr(lhs_offsets),
-        strides=_i64_array_attr(lhs_strides)))
-
-    rhs_offsets = Int64[i == mlir_axis ? Int(size(lhs_t, mlir_axis + 1)) : 0
-                        for i in 0:(out_rank - 1)]
-    rhs_strides = Int64[1 for _ in 0:(ndims(rhs_t) - 1)]
-    return IR.result(_vector.insert_strided_slice(rhs, base1;
-        res=out_t,
-        offsets=_i64_array_attr(rhs_offsets),
-        strides=_i64_array_attr(rhs_strides)))
-end
 
 # cuTile Intrinsics.extract(tile, index, shape) — extract a non-overlapping
 # subtile at slice (index) of size (shape). Both `index` and `shape` are in
 # Julia col-major order; `index` is 0-indexed (frontend already converted from
 # 1-based). Lowers to `vector.extract_strided_slice`, with axes reversed for
 # MLIR's row-major convention.
-function emit_extract!(lc::LowerCtx, args, @nospecialize(typ))
-    src_v = resolve_value_or_const(lc, args[1])
-    src_v === nothing && error("extract: cannot resolve source operand $(args[1])")
-    index_t = something(resolve_const(lc, args[2]), args[2])
-    if index_t isa SSAValue
-        haskey(lc.tuples, index_t.id) ||
-            error("extract: cannot resolve index tuple SSA $(args[2])")
-        index_t = Tuple(lc.tuples[index_t.id])
-    end
-    index_t isa Tuple ||
-        error("extract: index must be a tuple, got $index_t")
-    shape_t = something(resolve_const(lc, args[3]), args[3])
-    if shape_t isa SSAValue
-        haskey(lc.tuples, shape_t.id) ||
-            error("extract: cannot resolve shape tuple SSA $(args[3])")
-        shape_t = Tuple(lc.tuples[shape_t.id])
-    end
-    shape_t isa Tuple ||
-        error("extract: shape must be a tuple, got $shape_t")
-    length(index_t) == length(shape_t) ||
-        error("extract: index and shape lengths differ ($index_t vs $shape_t)")
-
-    n = length(shape_t)
-    julia_idx = Int[Int(i) for i in index_t]
-    julia_shape = Int[Int(s) for s in shape_t]
-
-    # Result type from `typ` (the cuTile Tile{T, Tuple{shape...}} return).
-    eT = tile_eltype(typ)
-    eT === nothing &&
-        error("extract: cannot determine element type from $typ")
-    out_t = mlir_tile_type(Tuple(julia_shape), eT)
-
-    # Map Julia col-major axes to MLIR row-major axes: axis k_jl → k_mlir = n-1-k_jl.
-    # Offset along each axis is index * shape (slice-mode semantics).
-    # NOTE: `vector.extract_strided_slice` (and `vector.insert_strided_slice`)
-    # consume the offsets/sizes/strides as `ArrayAttr` of i64 attributes — not
-    # `DenseArrayAttr`. Passing the latter silently drops the attribute.
-    mlir_offsets = Int64[julia_idx[n - i] * julia_shape[n - i] for i in 0:(n - 1)]
-    mlir_sizes   = Int64[julia_shape[n - i] for i in 0:(n - 1)]
-    mlir_strides = Int64[1 for _ in 0:(n - 1)]
-
-    return IR.result(_vector.extract_strided_slice(src_v;
-        result_0=out_t,
-        offsets=_i64_array_attr(mlir_offsets),
-        sizes=_i64_array_attr(mlir_sizes),
-        strides=_i64_array_attr(mlir_strides)))
-end
 
 # Build an `ArrayAttr` of i64 attributes — the format `vector.{insert,extract}_strided_slice`
 # expect for their offsets/sizes/strides attributes (a `DenseArrayAttr` is silently
 # dropped by the create-op state).
-function _i64_array_attr(vs::AbstractVector{<:Integer})
-    return IR.Attribute(IR.Attribute[IR.Attribute(Int64(v)) for v in vs])
-end
 
 # cuTile Intrinsics.get_num_tile_blocks(axis) — grid extent along the given
 # 0-indexed axis. For axes within the runtime grid, return `index_cast` of
 # the grid Value (held by the outer wrapper) cast to i32. For axes beyond
 # the grid (cuTile's `rng_key` always reads axes 0..1 even on 1-D launches),
 # return constant Int32(1).
-function emit_num_tile_blocks!(lc::LowerCtx, args, @nospecialize(typ))
-    axis = something(resolve_const(lc, args[1]), args[1])
-    axis isa Integer ||
-        error("get_num_tile_blocks: axis must be const int, got $(args[1])")
-    ax = Int(axis)
-    # `axis` is 0-indexed. Return the corresponding i32 grid extent. For axes
-    # beyond `n_grid_dims` (cuTile's `rng_key` unconditionally reads axes
-    # 0..1 even on 1-D launches), return constant Int32(1) — matching the
-    # device-side semantics where unused grid dims are 1.
-    if ax + 1 ≤ length(lc.grid_extents_i32)
-        return lc.grid_extents_i32[ax + 1]
-    end
-    return IR.result(_arith.constant(; value=IR.Attribute(Int32(1))))
-end
 
 # Unary math op (math.exp, math.log, …). Result type comes from the operand
 # (math ops are elementwise; the result type matches the operand type).
@@ -2453,31 +1676,9 @@ end
 
 # cuTile Intrinsics.fma(x, y, z) → math.fma. Same vector shape across all
 # three operands.
-function emit_fma!(lc::LowerCtx, args, @nospecialize(typ))
-    a = resolve_value_or_const(lc, args[1])
-    b = resolve_value_or_const(lc, args[2])
-    c = resolve_value_or_const(lc, args[3])
-    (a === nothing || b === nothing || c === nothing) &&
-        error("fma: unresolved operands ($(args[1]), $(args[2]), $(args[3]))")
-    return IR.result(_math.fma(a, b, c; result=IR.type(a)))
-end
 
 # cuTile Intrinsics.maxi(a, b, signedness)/mini(a, b, signedness) → arith
 # max{s,u}i / min{s,u}i. Signedness is the 3rd arg.
-function emit_maxmin_int!(lc::LowerCtx, args, sop_fn, uop_fn)
-    a = resolve_value_or_const(lc, args[1])
-    b = resolve_value_or_const(lc, args[2])
-    (a === nothing || b === nothing) &&
-        error("maxi/mini: unresolved operands ($(args[1]), $(args[2]))")
-    signed = length(args) >= 3 ?
-             something(resolve_const(lc, args[3]), args[3]) :
-             ct.Signedness.Signed
-    if signed === ct.Signedness.Unsigned
-        return IR.result(uop_fn(a, b))
-    else
-        return IR.result(sop_fn(a, b))
-    end
-end
 
 # cuTile cmpi(lhs, rhs, predicate::ComparisonPredicate.T, sign::Signedness.T)
 # → arith.cmpi with the matching i64 predicate attribute.
@@ -2489,10 +1690,10 @@ function emit_cmpi!(lc::LowerCtx, args, @nospecialize(typ))
     pred = something(resolve_const(lc, args[3]), args[3])
     signed = length(args) >= 4 ?
              something(resolve_const(lc, args[4]), args[4]) :
-             ct.Signedness.Signed
-    pred isa ct.ComparisonPredicate.T ||
+             Signedness.Signed
+    pred isa ComparisonPredicate.T ||
         error("cmpi: predicate must be ComparisonPredicate.T, got $pred")
-    signed isa ct.Signedness.T ||
+    signed isa Signedness.T ||
         error("cmpi: signedness must be Signedness.T, got $signed")
     mlir_pred = cmpi_predicate_code(pred, signed)
     pred_attr = IR.Attribute(mlir_pred, IR.Type(Int64))
@@ -2506,14 +1707,14 @@ function emit_cmpi!(lc::LowerCtx, args, @nospecialize(typ))
     return IR.result(_arith.cmpi(a, b; predicate=pred_attr))
 end
 
-function cmpi_predicate_code(pred::ct.ComparisonPredicate.T, signed::ct.Signedness.T)
-    pred === ct.ComparisonPredicate.Equal && return 0
-    pred === ct.ComparisonPredicate.NotEqual && return 1
-    is_signed = signed === ct.Signedness.Signed
-    pred === ct.ComparisonPredicate.LessThan        && return is_signed ? 2 : 6
-    pred === ct.ComparisonPredicate.LessThanOrEqual && return is_signed ? 3 : 7
-    pred === ct.ComparisonPredicate.GreaterThan     && return is_signed ? 4 : 8
-    pred === ct.ComparisonPredicate.GreaterThanOrEqual && return is_signed ? 5 : 9
+function cmpi_predicate_code(pred::ComparisonPredicate.T, signed::Signedness.T)
+    pred === ComparisonPredicate.Equal && return 0
+    pred === ComparisonPredicate.NotEqual && return 1
+    is_signed = signed === Signedness.Signed
+    pred === ComparisonPredicate.LessThan        && return is_signed ? 2 : 6
+    pred === ComparisonPredicate.LessThanOrEqual && return is_signed ? 3 : 7
+    pred === ComparisonPredicate.GreaterThan     && return is_signed ? 4 : 8
+    pred === ComparisonPredicate.GreaterThanOrEqual && return is_signed ? 5 : 9
     error("cmpi: unsupported predicate $pred")
 end
 
@@ -2526,8 +1727,8 @@ function emit_cmpf!(lc::LowerCtx, args, @nospecialize(typ))
     pred = something(resolve_const(lc, args[3]), args[3])
     ord  = length(args) >= 4 ?
            something(resolve_const(lc, args[4]), args[4]) :
-           ct.ComparisonOrdering.Ordered
-    pred isa ct.ComparisonPredicate.T ||
+           ComparisonOrdering.Ordered
+    pred isa ComparisonPredicate.T ||
         error("cmpf: predicate must be ComparisonPredicate.T, got $pred")
     code = cmpf_predicate_code(pred, ord)
     pred_attr = IR.Attribute(code, IR.Type(Int64))
@@ -2538,92 +1739,28 @@ function emit_cmpf!(lc::LowerCtx, args, @nospecialize(typ))
     return IR.result(_arith.cmpf(a, b; predicate=pred_attr))
 end
 
-function cmpf_predicate_code(pred::ct.ComparisonPredicate.T, ord::ct.ComparisonOrdering.T)
-    is_ord = ord === ct.ComparisonOrdering.Ordered
-    pred === ct.ComparisonPredicate.Equal           && return is_ord ? 1  : 8
-    pred === ct.ComparisonPredicate.GreaterThan     && return is_ord ? 2  : 9
-    pred === ct.ComparisonPredicate.GreaterThanOrEqual && return is_ord ? 3 : 10
-    pred === ct.ComparisonPredicate.LessThan        && return is_ord ? 4  : 11
-    pred === ct.ComparisonPredicate.LessThanOrEqual && return is_ord ? 5  : 12
-    pred === ct.ComparisonPredicate.NotEqual        && return is_ord ? 6  : 13
+function cmpf_predicate_code(pred::ComparisonPredicate.T, ord::ComparisonOrdering.T)
+    is_ord = ord === ComparisonOrdering.Ordered
+    pred === ComparisonPredicate.Equal           && return is_ord ? 1  : 8
+    pred === ComparisonPredicate.GreaterThan     && return is_ord ? 2  : 9
+    pred === ComparisonPredicate.GreaterThanOrEqual && return is_ord ? 3 : 10
+    pred === ComparisonPredicate.LessThan        && return is_ord ? 4  : 11
+    pred === ComparisonPredicate.LessThanOrEqual && return is_ord ? 5  : 12
+    pred === ComparisonPredicate.NotEqual        && return is_ord ? 6  : 13
     error("cmpf: unsupported predicate $pred")
 end
 
 # cuTile exti(x, target_jl_type, sign) → arith.extsi / arith.extui
-function emit_exti!(lc::LowerCtx, args, @nospecialize(typ))
-    v = resolve_value_or_const(lc, args[1])
-    v === nothing && error("exti: unresolved operand $(args[1])")
-    target_T = something(resolve_const(lc, args[2]), args[2])
-    target_T isa Type ||
-        error("exti: target type must be a Type, got $target_T")
-    signed = length(args) >= 3 ?
-             something(resolve_const(lc, args[3]), args[3]) :
-             ct.Signedness.Signed
-    # Determine result MLIR type: if `typ` is a tile, use its mlir vector
-    # type; else scalar of target_T.
-    out_t = if typ isa DataType && typ <: ct.Tile
-        mlir_type_for_tile(typ)
-    else
-        mlir_elem_type(target_T)
-    end
-    if signed === ct.Signedness.Unsigned
-        return IR.result(_arith.extui(v; out=out_t))
-    else
-        return IR.result(_arith.extsi(v; out=out_t))
-    end
-end
 
 # cuTile Intrinsics.cldi(lhs, rhs, sign) → arith.ceildivsi / arith.ceildivui.
-function emit_cldi!(lc::LowerCtx, args, @nospecialize(typ))
-    a = resolve_value_or_const(lc, args[1])
-    b = resolve_value_or_const(lc, args[2])
-    (a === nothing || b === nothing) &&
-        error("cldi: unresolved operands ($(args[1]), $(args[2]))")
-    signed = length(args) >= 3 ?
-             something(resolve_const(lc, args[3]), args[3]) :
-             ct.Signedness.Signed
-    if signed === ct.Signedness.Unsigned
-        return IR.result(_arith.ceildivui(a, b))
-    else
-        return IR.result(_arith.ceildivsi(a, b))
-    end
-end
 
 # cuTile Intrinsics.remi(lhs, rhs, sign) → arith.remsi / arith.remui.
 # Surfaces from `rem(::IntTile, ::Integer)` (and tile/tile variants); the
 # atomic histogram path uses this for bucket = v % n_buckets.
-function emit_remi!(lc::LowerCtx, args, @nospecialize(typ))
-    a = resolve_value_or_const(lc, args[1])
-    b = resolve_value_or_const(lc, args[2])
-    (a === nothing || b === nothing) &&
-        error("remi: unresolved operands ($(args[1]), $(args[2]))")
-    signed = length(args) >= 3 ?
-             something(resolve_const(lc, args[3]), args[3]) :
-             ct.Signedness.Signed
-    if signed === ct.Signedness.Unsigned
-        return IR.result(_arith.remui(a, b))
-    else
-        return IR.result(_arith.remsi(a, b))
-    end
-end
 
 # cuTile Intrinsics.fldi(lhs, rhs, sign) → arith.floordivsi / arith.divui.
 # `fldi` is signed floor-division (rounding toward -∞) for signed args; on
 # the unsigned side it coincides with truncated division (`arith.divui`).
-function emit_fldi!(lc::LowerCtx, args, @nospecialize(typ))
-    a = resolve_value_or_const(lc, args[1])
-    b = resolve_value_or_const(lc, args[2])
-    (a === nothing || b === nothing) &&
-        error("fldi: unresolved operands ($(args[1]), $(args[2]))")
-    signed = length(args) >= 3 ?
-             something(resolve_const(lc, args[3]), args[3]) :
-             ct.Signedness.Signed
-    if signed === ct.Signedness.Unsigned
-        return IR.result(_arith.divui(a, b))
-    else
-        return IR.result(_arith.floordivsi(a, b))
-    end
-end
 
 # cuTile Intrinsics.mma(lhs, rhs, acc) — matrix-multiply-accumulate in
 # TileIR-row-major form. The cuTile frontend's `muladd(a, b, acc)` for
@@ -2658,112 +1795,11 @@ end
 # We dispatch on the rank of `acc` (which is also the rank of lhs/rhs in cuTile's
 # canonical batched form): 2 → plain matmul, 3 → batched matmul. Higher ranks
 # don't occur because cuTile pre-flattens batch dims to a single axis.
-function emit_mma!(lc::LowerCtx, args, @nospecialize(typ))
-    a = resolve_value_or_const(lc, args[1])
-    b = resolve_value_or_const(lc, args[2])
-    acc = resolve_value_or_const(lc, args[3])
-    (a === nothing || b === nothing || acc === nothing) &&
-        error("mma: unresolved operands ($(args[1]), $(args[2]), $(args[3])))")
-    result_t = IR.type(acc)
-
-    acc_t = IR.type(acc)
-    rank = IR.isvector(acc_t) ? ndims(acc_t) : 0
-    if rank == 2
-        iter_attr = IR.Attribute(IR.Attribute[
-            parse(IR.Attribute, "#vector.iterator_type<parallel>"),
-            parse(IR.Attribute, "#vector.iterator_type<parallel>"),
-            parse(IR.Attribute, "#vector.iterator_type<reduction>"),
-        ])
-        lhs_map = parse(IR.Attribute, "affine_map<(m, n, k) -> (n, k)>")
-        rhs_map = parse(IR.Attribute, "affine_map<(m, n, k) -> (k, m)>")
-        acc_map = parse(IR.Attribute, "affine_map<(m, n, k) -> (n, m)>")
-    elseif rank == 3
-        iter_attr = IR.Attribute(IR.Attribute[
-            parse(IR.Attribute, "#vector.iterator_type<parallel>"),   # b
-            parse(IR.Attribute, "#vector.iterator_type<parallel>"),   # m
-            parse(IR.Attribute, "#vector.iterator_type<parallel>"),   # n
-            parse(IR.Attribute, "#vector.iterator_type<reduction>"),  # k
-        ])
-        lhs_map = parse(IR.Attribute, "affine_map<(b, m, n, k) -> (b, n, k)>")
-        rhs_map = parse(IR.Attribute, "affine_map<(b, m, n, k) -> (b, k, m)>")
-        acc_map = parse(IR.Attribute, "affine_map<(b, m, n, k) -> (b, n, m)>")
-    else
-        error("mma: unsupported acc rank $rank (expected 2 or 3)")
-    end
-    maps_attr = IR.Attribute(IR.Attribute[lhs_map, rhs_map, acc_map])
-
-    kind_attr = parse(IR.Attribute, "#vector.kind<add>")
-    return IR.result(_vector.contract(a, b, acc;
-        result_0=result_t,
-        indexing_maps=maps_attr,
-        iterator_types=iter_attr,
-        kind=kind_attr))
-end
 
 # cuTile Intrinsics.broadcast(src, target_shape_tuple) → vector.broadcast.
 # `src` can be a scalar literal, a Const-arg scalar, a 0-D / smaller tile.
-function emit_broadcast!(lc::LowerCtx, args, @nospecialize(typ))
-    src = args[1]
-    target_shape = something(resolve_const(lc, args[2]), args[2])
-    if target_shape isa SSAValue
-        # Tuple-tracked target shape.
-        haskey(lc.tuples, target_shape.id) ||
-            error("broadcast: cannot resolve target-shape tuple SSA")
-        target_shape = Tuple(lc.tuples[target_shape.id])
-    end
-    target_shape isa Tuple ||
-        error("broadcast: target shape must be a tuple, got $target_shape")
-    # Materialise src as a Value.
-    src_v = resolve_value_or_const(lc, src)
-    src_v === nothing && error("broadcast: cannot resolve source operand $src")
-    # Element type comes from `typ`.
-    eT = tile_eltype(typ)
-    eT === nothing && (eT = typeof(src isa Number ? src : 0f0))
-    vec_t = mlir_tile_type(target_shape, eT)
-    return IR.result(_vector.broadcast(src_v; vector=vec_t))
-end
 
 # cuTile Intrinsics.reshape(tile, target_shape_tuple) → vector.shape_cast.
-function emit_reshape!(lc::LowerCtx, args, @nospecialize(typ))
-    src_v = resolve_value_or_const(lc, args[1])
-    src_v === nothing && error("reshape: cannot resolve source")
-    target_shape = something(resolve_const(lc, args[2]), args[2])
-    if target_shape isa SSAValue
-        haskey(lc.tuples, target_shape.id) ||
-            error("reshape: cannot resolve target-shape tuple SSA")
-        target_shape = Tuple(lc.tuples[target_shape.id])
-    end
-    target_shape isa Tuple ||
-        error("reshape: target shape must be a tuple, got $target_shape")
-    eT = tile_eltype(typ)
-    eT === nothing &&
-        error("reshape: cannot determine element type from $typ")
-    out_t = mlir_tile_type(target_shape, eT)
-    # 0-D corner case: target shape `()` means scalar element. shape_cast
-    # cannot produce a non-vector result, so fall back to a single
-    # `vector.extract` at lane 0 — requires the source to be a 1-element
-    # 1-D vector (the only meaningful case here).
-    if isempty(target_shape)
-        src_t = IR.type(src_v)
-        if !IR.isvector(src_t)
-            # Already a scalar — identity reshape.
-            return src_v
-        end
-        pos_attr = IR.DenseArrayAttribute(Int64[0])
-        return IR.result(_vector.extract(src_v, IR.Value[];
-            result=out_t, static_position=pos_attr))
-    end
-    src_t = IR.type(src_v)
-    if !IR.isvector(src_t)
-        # Scalar → vector with target_shape: arises when a 0-D tile (e.g. the
-        # result of `atomic_add` or `bid + 1`) needs to be reshaped to a
-        # single-lane (or broadcast-shape) tile prior to a tile store. The
-        # SCI emits `reshape(scalar, (1,))` here; `vector.shape_cast` rejects
-        # the scalar operand, so we lift it to a vector via `vector.broadcast`.
-        return IR.result(_vector.broadcast(src_v; vector=out_t))
-    end
-    return IR.result(_vector.shape_cast(src_v; result=out_t))
-end
 
 # cuTile Intrinsics.permute(tile, perm) → vector.transpose.
 #
@@ -2777,203 +1813,19 @@ end
 #   mlir_perm[i] = n - 1 - julia_perm[n - 1 - i]   for i in 0:n-1.
 # The result MLIR vector type is the input MLIR vector type with its dims
 # reordered by `mlir_perm`.
-function emit_permute!(lc::LowerCtx, args, @nospecialize(typ))
-    src_v = resolve_value_or_const(lc, args[1])
-    src_v === nothing && error("permute: cannot resolve source operand $(args[1])")
-    perm_const = something(resolve_const(lc, args[2]), args[2])
-    if perm_const isa SSAValue
-        haskey(lc.tuples, perm_const.id) ||
-            error("permute: cannot resolve perm tuple SSA $(args[2])")
-        perm_const = Tuple(lc.tuples[perm_const.id])
-    end
-    perm_const isa Tuple ||
-        error("permute: permutation must be a tuple, got $perm_const")
-    n = length(perm_const)
-    julia_perm = Int[Int(p) for p in perm_const]
-    mlir_perm = Int64[n - 1 - julia_perm[n - i] for i in 0:n-1]
-
-    eT = tile_eltype(typ)
-    eT === nothing && error("permute: cannot determine element type from $typ")
-    out_shape = Tuple(tile_shape(typ))
-    out_t = mlir_tile_type(out_shape, eT)
-    perm_attr = IR.DenseArrayAttribute(mlir_perm)
-    return IR.result(_vector.transpose(src_v; result=out_t, permutation=perm_attr))
-end
 
 # cuTile Intrinsics.constant(shape::Tuple, value, T) → arith.constant of a
 # splat dense<value> : vector<...xT> when `value` is a compile-time literal.
 # When `value` is a runtime SSA (cuTile's `fill(scalar, dims)` overlay uses
 # this form to broadcast a scalar to a tile), we instead lower to
 # `vector.broadcast` of the scalar Value.
-function emit_intr_constant!(lc::LowerCtx, args, @nospecialize(typ))
-    shape = something(resolve_const(lc, args[1]), args[1])
-    if shape isa SSAValue
-        haskey(lc.tuples, shape.id) ||
-            error("constant: cannot resolve shape tuple SSA")
-        shape = Tuple(lc.tuples[shape.id])
-    end
-    shape isa Tuple ||
-        error("constant: shape must be a tuple, got $shape")
-    val_arg = args[2]
-    val_const = resolve_const(lc, val_arg)
-    T = length(args) >= 3 ?
-        something(resolve_const(lc, args[3]), args[3]) :
-        (val_const isa Number ? typeof(val_const) : nothing)
-    T isa Type || error("constant: type must be a Type, got $T")
-
-    if val_const isa Number
-        converted = convert(T, val_const)
-        if isempty(shape)
-            return _const_value(converted)
-        end
-        vec_t = mlir_tile_type(shape, T)
-        # Use Base.fill(value, shaped_type) — there are overloads for primitive
-        # element types (Bool/Int*/Float32/Float64) which produce a splat dense
-        # elements attribute. For Float16/BFloat16 we splat via the generic
-        # Attribute path (see `_splat_attr`).
-        splat = _splat_attr(converted, vec_t)
-        return IR.result(_arith.constant(; value=splat, result=vec_t))
-    end
-    # Runtime value (SSA / Argument): broadcast the scalar Value.
-    scalar_v = resolve_value_or_const(lc, val_arg)
-    scalar_v === nothing &&
-        error("constant: value must be a literal or resolvable Value, got $val_arg")
-    if isempty(shape)
-        return scalar_v
-    end
-    vec_t = mlir_tile_type(shape, T)
-    return IR.result(_vector.broadcast(scalar_v; vector=vec_t))
-end
 
 # cuTile Intrinsics.reduce((tile,), axis::Int, combiner, (identities,)) →
 # Tuple{Tile{..., reduced_shape_with_1_in_axis}}. Lowers to
 # vector.multi_reduction + vector.shape_cast (to re-add the size-1 dim that
 # cuTile's reduce semantics preserves).
-function emit_reduce!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
-    tiles_ref = args[1]
-    tiles_ref isa SSAValue && haskey(lc.tuples, tiles_ref.id) ||
-        error("reduce: input tiles tuple must be a tuple SSA, got $tiles_ref")
-    tile_refs = lc.tuples[tiles_ref.id]
-    length(tile_refs) == 1 ||
-        error("reduce: only single-tile reductions supported, got $(length(tile_refs))")
-    src_v = resolve_value_or_const(lc, tile_refs[1])
-    src_v === nothing && error("reduce: cannot resolve input tile")
-    julia_axis = something(resolve_const(lc, args[2]), args[2])
-    julia_axis isa Integer || error("reduce: axis must be const Int, got $julia_axis")
-    combiner = something(resolve_const(lc, args[3]), args[3])
-    identities_ref = args[4]
-    identities_ref isa SSAValue && haskey(lc.tuples, identities_ref.id) ||
-        identities_ref isa Tuple ||
-        error("reduce: identities must be a tuple, got $identities_ref")
-    id_vals = identities_ref isa SSAValue ? lc.tuples[identities_ref.id] : collect(identities_ref)
-    length(id_vals) == 1 ||
-        error("reduce: only one identity supported, got $(length(id_vals))")
-
-    # Result type from `typ`: Tuple{Tile{eT, shape_with_1_in_axis}}
-    typ isa DataType && typ <: Tuple && length(typ.parameters) == 1 ||
-        error("reduce: expected Tuple{Tile} result type, got $typ")
-    out_tile_T = typ.parameters[1]
-    out_shape  = Tuple(tile_shape(out_tile_T))
-    eT         = tile_eltype(out_tile_T)
-
-    # Input shape — derive from the tile_refs[1] type if we can.
-    in_tile_T = nothing
-    if tile_refs[1] isa SSAValue
-        # Look up from the sci type? We don't have it directly. Get from the
-        # vector type of the source Value.
-    end
-    # Compute MLIR reduction-dim from julia_axis (0-indexed col-major).
-    #   Julia (1-indexed) dim k <=> MLIR (0-indexed row-major) dim N-k.
-    #   julia_axis (0-indexed) k0 corresponds to Julia 1-indexed k = k0+1, so
-    #   MLIR dim = N - (k0+1) = N - 1 - k0.
-    # We need N: get it from the source Value's vector type.
-    src_t = IR.type(src_v)
-    @assert IR.isvector(src_t) "reduce: source must be a vector"
-    N = ndims(src_t)
-    mlir_dim = N - 1 - Int(julia_axis)
-    mlir_dim ≥ 0 && mlir_dim < N ||
-        error("reduce: axis $julia_axis out of range for rank $N")
-
-    # Build acc = broadcast of identity to the multi_reduction *output* shape
-    # (input shape with `mlir_dim` removed).
-    in_mlir_shape = [Int(size(src_t, i)) for i in 1:N]
-    out_mr_shape = Int[in_mlir_shape[i] for i in 1:N if (i - 1) != mlir_dim]
-    identity_val = id_vals[1]
-    identity_val isa Number ||
-        error("reduce: identity must be a literal number, got $identity_val")
-    identity_v = IR.result(_arith.constant(;
-        value=IR.Attribute(convert(eT, identity_val))))
-    acc_v = if isempty(out_mr_shape)
-        identity_v
-    else
-        acc_t = IR.VectorType(length(out_mr_shape), out_mr_shape, mlir_elem_type(eT))
-        IR.result(_vector.broadcast(identity_v; vector=acc_t))
-    end
-
-    # Kind attribute
-    kind_name = reduction_kind_name(combiner, eT)
-    kind_attr = parse(IR.Attribute, "#vector.kind<$kind_name>")
-    # `reduction_dims` is typed as `I64ArrayAttr` (regular `[N : i64]`) in
-    # MLIR 18 and `DenseI64ArrayAttr` (`array<i64: N>`) in MLIR 19+ — pick the
-    # right form from the active MLIR version. (Detected via `MLIR.MLIR_VERSION[]`.)
-    rd_attr = if MLIR.MLIR_VERSION[] < v"19"
-        parse(IR.Attribute, "[$(mlir_dim) : i64]")
-    else
-        parse(IR.Attribute, "array<i64: $(mlir_dim)>")
-    end
-
-    # Output type after multi_reduction = vector or scalar.
-    out_t = if isempty(out_mr_shape)
-        mlir_elem_type(eT)
-    else
-        IR.VectorType(length(out_mr_shape), out_mr_shape, mlir_elem_type(eT))
-    end
-    reduced_v = IR.result(_vector.multi_reduction(src_v, acc_v;
-        dest=out_t, kind=kind_attr, reduction_dims=rd_attr))
-
-    # Shape-cast back to the cuTile-preserved shape (size-1 in reduced axis).
-    final_t = mlir_tile_type(out_shape, eT)
-    final_v = if final_t === out_t
-        reduced_v
-    elseif out_t == mlir_elem_type(eT)
-        # Scalar → vector with leading 1s. Use broadcast.
-        IR.result(_vector.broadcast(reduced_v; vector=final_t))
-    else
-        IR.result(_vector.shape_cast(reduced_v; result=final_t))
-    end
-
-    # Store as a 1-tuple multi-result for downstream getfield.
-    lc.ssa_multi[idx] = IR.Value[final_v]
-    return nothing
-end
 
 # Map a cuTile combiner function + element type to a vector.kind name.
-function reduction_kind_name(combiner, eT::Type)
-    # cuTile's combiner is `cuTile.+` etc. — these are overloaded plus/min/max.
-    name = string(combiner)
-    if combiner === Base.:+ || endswith(name, ".+ ") || endswith(name, ".+")
-        return "add"
-    elseif combiner === Base.:*
-        return "mul"
-    elseif combiner === Base.max
-        return eT <: AbstractFloat ? "maxnumf" :
-               eT <: Signed        ? "maxsi"   : "maxui"
-    elseif combiner === Base.min
-        return eT <: AbstractFloat ? "minnumf" :
-               eT <: Signed        ? "minsi"   : "minui"
-    end
-    # Fallback by name
-    if occursin("+", name); return "add"; end
-    if occursin("max", lowercase(name))
-        return eT <: AbstractFloat ? "maxnumf" :
-               eT <: Signed        ? "maxsi"   : "maxui"
-    end
-    if occursin("min", lowercase(name))
-        return eT <: AbstractFloat ? "minnumf" :
-               eT <: Signed        ? "minsi"   : "minui"
-    end
-    error("reduce: unsupported combiner $combiner")
-end
 
 # Handle Base.getfield in both Argument-rooted (TileArray's ptr/sizes/strides
 # fields) and SSA-rooted (extract from a multi-result control-flow op or a
@@ -3058,11 +1910,7 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
                     value=IR.Attribute(mlir_dim, idx_t)))
                 dim_v = IR.result(_memref.dim(memref_v, idx_const; result=idx_t))
                 # Cast to the requested result type (Int32 normally).
-                if typ isa DataType && typ <: ct.Tile
-                    eT = tile_eltype(typ)
-                    out_t = mlir_elem_type(eT)
-                    return IR.result(_arith.index_cast(dim_v; out=out_t))
-                elseif typ isa Type && typ <: Integer
+                if typ isa Type && typ <: Integer
                     out_t = mlir_elem_type(typ)
                     return IR.result(_arith.index_cast(dim_v; out=out_t))
                 else
@@ -3211,9 +2059,7 @@ function if_result_types(@nospecialize(typ))
     jls = Type[]
     for p in typ.parameters
         push!(jls, p)
-        if p isa DataType && p <: ct.Tile
-            push!(rts, mlir_type_for_tile(p))
-        elseif p isa Type && p <: Number
+        if p isa Type && p <: Number
             push!(rts, mlir_elem_type(p))
         else
             error("scf.if: unsupported yield type $p")
@@ -3311,25 +2157,6 @@ end
 # then `arith.index_cast` to vector<NxiK>. cuTile produces Int32 indices by
 # default; the cast is mandatory because downstream cmpi/addi/bitcast all
 # expect the iK element type rather than `index`.
-function emit_iota!(lc::LowerCtx, args, @nospecialize(typ))
-    shape = something(resolve_const(lc, args[1]), args[1])
-    if shape isa SSAValue
-        haskey(lc.tuples, shape.id) ||
-            error("iota: cannot resolve shape tuple SSA")
-        shape = Tuple(lc.tuples[shape.id])
-    end
-    shape isa Tuple ||
-        error("iota: shape must be a tuple, got $shape")
-    T = something(resolve_const(lc, args[2]), args[2])
-    T isa Type || error("iota: dtype must be a Type, got $T")
-    length(shape) == 1 ||
-        error("iota: only 1-D iota is supported, got shape $shape")
-    N = Int(shape[1])
-    # `vector.step` is MLIR 19+. Emit a constant `[0, 1, ..., N-1]` directly
-    # in the iota dtype — same result, one fewer op.
-    out_t = mlir_tile_type(shape, T)
-    return _emit_step_vec(out_t, T, N)
-end
 
 # cuTile Intrinsics.bitcast(src, target_T) — a signless reinterpret. For tile
 # operands whose source MLIR type already matches the target MLIR element
@@ -3350,8 +2177,6 @@ function emit_bitcast!(lc::LowerCtx, args, @nospecialize(typ))
     out_t = if lc.spmd && IR.isvector(src_t)
         n = Int(size(src_t, 1))
         IR.VectorType(1, Int[n], elem_target)
-    elseif typ isa DataType && typ <: ct.Tile
-        mlir_type_for_tile(typ)
     else
         elem_target
     end
@@ -3368,90 +2193,15 @@ end
 # Tracked-only: we record the source memref (from the ptr operand's
 # field-ref) plus the index Value. The downstream gather/scatter consumes
 # this OffsetInfo.
-function emit_offset!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
-    ptr_ref = args[1]
-    ptr_ref isa SSAValue ||
-        error("Intrinsics.offset: ptr operand must be SSAValue, got $ptr_ref")
-    # Chase ptr → field_ref OR ptr → another OffsetInfo (chained offset).
-    base_memref = nothing
-    elem_T = nothing
-    if haskey(lc.field_refs, ptr_ref.id)
-        (arg_id, fld) = lc.field_refs[ptr_ref.id]
-        fld === :ptr ||
-            error("Intrinsics.offset: ptr operand must be a :ptr field, " *
-                  "got :$fld")
-        base_memref = lc.arg_vals[arg_id]
-        elem_T = lc.arg_elem_types[arg_id]
-    elseif haskey(lc.offsets, ptr_ref.id)
-        prev = lc.offsets[ptr_ref.id]
-        base_memref = prev.base
-        elem_T = prev.elem_type
-        # Chained offset: combine indices. Not needed for current tests.
-        error("Intrinsics.offset: chained offset not yet supported")
-    else
-        error("Intrinsics.offset: cannot resolve ptr operand %$(ptr_ref.id)")
-    end
-    idx_v = resolve_value_or_const(lc, args[2])
-    idx_v === nothing &&
-        error("Intrinsics.offset: cannot resolve index operand $(args[2])")
-    # Recover the index shape from the result tile type. 0-D pointer tiles
-    # (`Tile{Ptr{T}, Tuple{}}`) appear for scalar-index atomics — the
-    # downstream atomic_rmw uses the scalar index directly. Track the
-    # 0-D case with an empty `idx_shape`; gather/scatter consumers reject
-    # empty shapes (they require an i32-vector index), atomic consumers
-    # accept either form.
-    sh = typ isa DataType && typ <: ct.Tile ? Tuple(tile_shape(typ)) : ()
-    lc.offsets[idx] = OffsetInfo(base_memref, idx_v, elem_T, Int[sh...])
-    return nothing
-end
 
 # cuTile Intrinsics.load_ptr_tko(offset, latency, mask, padding, token) →
 # `vector.gather %base[%c0], %indices, %mask, %pass_thru : memref<...>,
 #  vector<Nxi32>, vector<Nxi1>, vector<NxT> into vector<NxT>`
 # args = [offset_ssa, latency, mask, padding, token]
-function emit_gather!(lc::LowerCtx, args, @nospecialize(typ))
-    off_ref = args[1]
-    off_ref isa SSAValue && haskey(lc.offsets, off_ref.id) ||
-        error("load_ptr_tko: ptr-tile operand must be an Intrinsics.offset " *
-              "SSA, got $off_ref")
-    off = lc.offsets[off_ref.id]
-    isempty(off.idx_shape) &&
-        error("load_ptr_tko: scalar-index offset (0-D) not supported by gather")
-    # Resolve mask. cuTile passes the bounds mask as args[3]; if `nothing`,
-    # synthesise an all-true mask.
-    mask_v = _resolve_or_alltrue_mask(lc, args[3], off.idx_shape)
-    # Resolve pass-through (padding). Some cuTile paths pass `nothing`; build
-    # a zero-of-elem-type splat in that case.
-    pad_v = _resolve_or_zero_passthru(lc, args[4], off.elem_type, off.idx_shape)
-    # Build the result type: vector<Nx{elem_T}>.
-    result_t = mlir_tile_type(Tuple(off.idx_shape), off.elem_type)
-    idx_t = IR.IndexType()
-    c0 = IR.result(_arith.constant(; value=IR.Attribute(Int(0), idx_t)))
-    return IR.result(_vector.gather(off.base, IR.Value[c0], off.indices,
-                                     mask_v, pad_v; result=result_t))
-end
 
 # cuTile Intrinsics.store_ptr_tko(offset, values, latency, mask, token) →
 # `vector.scatter %base[%c0], %indices, %mask, %values : memref<...>,
 #  vector<Nxi32>, vector<Nxi1>, vector<NxT>`
-function emit_scatter!(lc::LowerCtx, args, @nospecialize(typ))
-    off_ref = args[1]
-    off_ref isa SSAValue && haskey(lc.offsets, off_ref.id) ||
-        error("store_ptr_tko: ptr-tile operand must be an Intrinsics.offset " *
-              "SSA, got $off_ref")
-    off = lc.offsets[off_ref.id]
-    isempty(off.idx_shape) &&
-        error("store_ptr_tko: scalar-index offset (0-D) not supported by scatter")
-    val_v = resolve_value_or_const(lc, args[2])
-    val_v === nothing &&
-        error("store_ptr_tko: cannot resolve value-to-store $(args[2])")
-    mask_v = _resolve_or_alltrue_mask(lc, args[4], off.idx_shape)
-    _vector.scatter(off.base, IR.Value[
-        IR.result(_arith.constant(; value=IR.Attribute(Int(0),
-                                                       IR.IndexType())))],
-        off.indices, mask_v, val_v)
-    return nothing
-end
 
 # Resolve `mask_ref` to an i1-vector Value matching `idx_shape`. If it
 # resolves to `nothing` (cuTile passed `nothing` for "no mask"), construct
@@ -3628,336 +2378,32 @@ end
 # Args: (ptr_tile_ssa, val, mask, memory_order, memory_scope, token)
 # For the 0-D (scalar-index) form we emit a single atomic_rmw. For N-D tiles
 # we unroll one atomic per lane, optionally guarded by the mask.
-function emit_atomic_rmw!(lc::LowerCtx, args, @nospecialize(typ), op::Symbol)
-    off_ref = args[1]
-    off_ref isa SSAValue && haskey(lc.offsets, off_ref.id) ||
-        error("atomic_$op: ptr-tile operand must be an Intrinsics.offset SSA, " *
-              "got $off_ref")
-    off = lc.offsets[off_ref.id]
-    elem_T = off.elem_type
-    kind_kw = _atomic_rmw_kind(op, elem_T)
-
-    val_v = resolve_value_or_const(lc, args[2])
-    val_v === nothing && error("atomic_$op: cannot resolve val operand $(args[2])")
-
-    if isempty(off.idx_shape)
-        # 0-D form: off.indices is the scalar (i32) index. Single atomic.
-        return _emit_one_atomic_rmw!(off.base, off.indices, val_v, kind_kw,
-                                     elem_T)
-    end
-
-    # N-D form: iterate lanes (1-D only for now), masked when a mask is
-    # provided. cuTile lowers the histogram path with a (N,) tile shape and
-    # an Int32 lane index — we extract each lane statically via
-    # `vector.extract`. Multi-D tiles unroll into row-major linear lanes.
-    mask_ref = length(args) >= 3 ? args[3] : nothing
-    mask_v = resolve_value_or_const(lc, mask_ref)
-
-    n_lanes = prod(off.idx_shape)
-    elem_mlir = mlir_elem_type(elem_T)
-    idx_elem_t = eltype(IR.type(off.indices))
-
-    last_old = nothing
-    for lane in 0:(n_lanes - 1)
-        pos_attr = IR.DenseArrayAttribute(Int64[lane])
-        idx_scalar = IR.result(_vector.extract(off.indices, IR.Value[];
-            result=idx_elem_t, static_position=pos_attr))
-        val_scalar = IR.result(_vector.extract(val_v, IR.Value[];
-            result=elem_mlir, static_position=pos_attr))
-
-        if mask_v === nothing
-            last_old = _emit_one_atomic_rmw!(off.base, idx_scalar, val_scalar,
-                                             kind_kw, elem_T)
-        else
-            mask_bit = IR.result(_vector.extract(mask_v, IR.Value[];
-                result=IR.Type(Bool), static_position=pos_attr))
-            # `scf.if mask` containing the atomic; result is discarded (we
-            # don't model the per-lane old-value tile on the masked path).
-            then_region = IR.Region()
-            else_region = IR.Region()
-            then_block = IR.Block(IR.Type[], IR.Location[])
-            else_block = IR.Block(IR.Type[], IR.Location[])
-            push!(then_region, then_block)
-            push!(else_region, else_block)
-            @with_block then_block begin
-                _emit_one_atomic_rmw!(off.base, idx_scalar, val_scalar,
-                                      kind_kw, elem_T)
-                _scf.yield(IR.Value[])
-            end
-            @with_block else_block begin
-                _scf.yield(IR.Value[])
-            end
-            _scf.if_(mask_bit; results=IR.Type[],
-                     thenRegion=then_region, elseRegion=else_region)
-        end
-    end
-    # cuTile's RMW intrinsics return a tile of old values; we don't model
-    # that result for the N-D path (no consumer of the SSA in the counter
-    # tests). Return the last scalar's result for the 0-D-shape-1 case where
-    # callers may forward it; an unused multi-lane result is dropped.
-    return last_old
-end
 
 # Emit one `memref.generic_atomic_rmw` performing compare-and-swap:
 #   if loaded == expected: yield desired
 #   else:                  yield loaded
 # Returns the prior (loaded) value, matching cuTile semantics.
-function _emit_one_atomic_cas!(base_memref::IR.Value, idx_v::IR.Value,
-                                expected_v::IR.Value, desired_v::IR.Value,
-                                elem_T::Type)
-    elem_mlir = mlir_elem_type(elem_T)
-    idx_index = cast_to_index(idx_v)
-
-    body_region = IR.Region()
-    body_block = IR.Block(IR.Type[elem_mlir], IR.Location[IR.Location()])
-    push!(body_region, body_block)
-
-    @with_block body_block begin
-        loaded = IR.argument(body_block, 1)
-        # Equality predicate for arith.cmpi is code 0 (`eq`). Works for any
-        # integer type; for floats we'd want arith.cmpf, but cuTile's
-        # `atomic_cas` is typically used on integer locks / counters and
-        # MLIR's atomic_rmw is signless integer anyway. If float CAS is
-        # added later, branch on `elem_T <: AbstractFloat` here.
-        if elem_T <: AbstractFloat
-            # ordered equal = code 1 on arith.cmpf
-            pred_attr = IR.Attribute(1, IR.Type(Int64))
-            eq = IR.result(_arith.cmpf(loaded, expected_v; predicate=pred_attr))
-        else
-            pred_attr = IR.Attribute(0, IR.Type(Int64))
-            eq = IR.result(_arith.cmpi(loaded, expected_v; predicate=pred_attr))
-        end
-        chosen = IR.result(_arith.select(eq, desired_v, loaded))
-        _memref.atomic_yield(chosen)
-    end
-
-    return IR.result(_memref.generic_atomic_rmw(base_memref, IR.Value[idx_index];
-                                                 result=elem_mlir,
-                                                 atomic_body=body_region))
-end
 
 # Top-level dispatch for `Intrinsics.atomic_cas`.
 # Args: (ptr_tile_ssa, expected, desired, mask, memory_order, memory_scope)
 # For the 0-D scalar-index form we emit a single generic_atomic_rmw. For the
 # N-D tile form we unroll one CAS per lane (optionally masked).
-function emit_atomic_cas!(lc::LowerCtx, args, @nospecialize(typ))
-    off_ref = args[1]
-    off_ref isa SSAValue && haskey(lc.offsets, off_ref.id) ||
-        error("atomic_cas: ptr-tile operand must be an Intrinsics.offset SSA, " *
-              "got $off_ref")
-    off = lc.offsets[off_ref.id]
-    elem_T = off.elem_type
-
-    expected_v = resolve_value_or_const(lc, args[2])
-    expected_v === nothing &&
-        error("atomic_cas: cannot resolve expected operand $(args[2])")
-    desired_v = resolve_value_or_const(lc, args[3])
-    desired_v === nothing &&
-        error("atomic_cas: cannot resolve desired operand $(args[3])")
-
-    if isempty(off.idx_shape)
-        # 0-D form: scalar (i32) index. Single CAS.
-        return _emit_one_atomic_cas!(off.base, off.indices,
-                                      expected_v, desired_v, elem_T)
-    end
-
-    # N-D form: unroll one CAS per lane. cuTile broadcasts both expected and
-    # desired to the index tile shape, so both arrive as vectors. Mask is
-    # optional (bounds-check tile).
-    mask_ref = length(args) >= 4 ? args[4] : nothing
-    mask_v = resolve_value_or_const(lc, mask_ref)
-
-    n_lanes = prod(off.idx_shape)
-    elem_mlir = mlir_elem_type(elem_T)
-    idx_elem_t = eltype(IR.type(off.indices))
-
-    last_old = nothing
-    for lane in 0:(n_lanes - 1)
-        pos_attr = IR.DenseArrayAttribute(Int64[lane])
-        idx_scalar = IR.result(_vector.extract(off.indices, IR.Value[];
-            result=idx_elem_t, static_position=pos_attr))
-        exp_scalar = IR.result(_vector.extract(expected_v, IR.Value[];
-            result=elem_mlir, static_position=pos_attr))
-        des_scalar = IR.result(_vector.extract(desired_v, IR.Value[];
-            result=elem_mlir, static_position=pos_attr))
-
-        if mask_v === nothing
-            last_old = _emit_one_atomic_cas!(off.base, idx_scalar,
-                                              exp_scalar, des_scalar, elem_T)
-        else
-            mask_bit = IR.result(_vector.extract(mask_v, IR.Value[];
-                result=IR.Type(Bool), static_position=pos_attr))
-            then_region = IR.Region()
-            else_region = IR.Region()
-            then_block = IR.Block(IR.Type[], IR.Location[])
-            else_block = IR.Block(IR.Type[], IR.Location[])
-            push!(then_region, then_block)
-            push!(else_region, else_block)
-            @with_block then_block begin
-                _emit_one_atomic_cas!(off.base, idx_scalar,
-                                       exp_scalar, des_scalar, elem_T)
-                _scf.yield(IR.Value[])
-            end
-            @with_block else_block begin
-                _scf.yield(IR.Value[])
-            end
-            _scf.if_(mask_bit; results=IR.Type[],
-                     thenRegion=then_region, elseRegion=else_region)
-        end
-    end
-    return last_old
-end
 
 # Emit one `memref.generic_atomic_rmw` performing a custom binary RMW (used
 # for ops the upstream `memref.atomic_rmw` enum doesn't cover — currently
 # `atomic_xor`). `binop` is one of the `_arith` dialect binary-op functions
 # (e.g. `_arith.xori`). The region body computes `new = binop(loaded, val_v)`
 # and yields it. Returns the prior (loaded) value.
-function _emit_one_atomic_rmw_generic!(base_memref::IR.Value, idx_v::IR.Value,
-                                         val_v::IR.Value, binop,
-                                         elem_T::Type)
-    elem_mlir = mlir_elem_type(elem_T)
-    idx_index = cast_to_index(idx_v)
-
-    body_region = IR.Region()
-    body_block = IR.Block(IR.Type[elem_mlir], IR.Location[IR.Location()])
-    push!(body_region, body_block)
-
-    @with_block body_block begin
-        loaded = IR.argument(body_block, 1)
-        newval = IR.result(binop(loaded, val_v))
-        _memref.atomic_yield(newval)
-    end
-
-    return IR.result(_memref.generic_atomic_rmw(base_memref, IR.Value[idx_index];
-                                                  result=elem_mlir,
-                                                  atomic_body=body_region))
-end
 
 # Top-level dispatch for RMW ops the upstream `memref.atomic_rmw` enum
 # doesn't cover (currently `:xor`). Same args shape as
 # `Intrinsics.atomic_{or,and,xor}` — (ptr_tile, val, mask, order, scope).
-function emit_atomic_rmw_generic!(lc::LowerCtx, args, @nospecialize(typ),
-                                    op::Symbol)
-    op === :xor || error("atomic_rmw_generic: unsupported op $op")
-    off_ref = args[1]
-    off_ref isa SSAValue && haskey(lc.offsets, off_ref.id) ||
-        error("atomic_$op: ptr-tile operand must be an Intrinsics.offset SSA, " *
-              "got $off_ref")
-    off = lc.offsets[off_ref.id]
-    elem_T = off.elem_type
-    elem_T <: AbstractFloat && error("atomic_xor: float element type not supported")
-    binop = _arith.xori
-
-    val_v = resolve_value_or_const(lc, args[2])
-    val_v === nothing && error("atomic_$op: cannot resolve val operand $(args[2])")
-
-    if isempty(off.idx_shape)
-        return _emit_one_atomic_rmw_generic!(off.base, off.indices, val_v,
-                                               binop, elem_T)
-    end
-
-    mask_ref = length(args) >= 3 ? args[3] : nothing
-    mask_v = resolve_value_or_const(lc, mask_ref)
-
-    n_lanes = prod(off.idx_shape)
-    elem_mlir = mlir_elem_type(elem_T)
-    idx_elem_t = eltype(IR.type(off.indices))
-
-    last_old = nothing
-    for lane in 0:(n_lanes - 1)
-        pos_attr = IR.DenseArrayAttribute(Int64[lane])
-        idx_scalar = IR.result(_vector.extract(off.indices, IR.Value[];
-            result=idx_elem_t, static_position=pos_attr))
-        val_scalar = IR.result(_vector.extract(val_v, IR.Value[];
-            result=elem_mlir, static_position=pos_attr))
-
-        if mask_v === nothing
-            last_old = _emit_one_atomic_rmw_generic!(off.base, idx_scalar,
-                                                       val_scalar, binop, elem_T)
-        else
-            mask_bit = IR.result(_vector.extract(mask_v, IR.Value[];
-                result=IR.Type(Bool), static_position=pos_attr))
-            then_region = IR.Region()
-            else_region = IR.Region()
-            then_block = IR.Block(IR.Type[], IR.Location[])
-            else_block = IR.Block(IR.Type[], IR.Location[])
-            push!(then_region, then_block)
-            push!(else_region, else_block)
-            @with_block then_block begin
-                _emit_one_atomic_rmw_generic!(off.base, idx_scalar, val_scalar,
-                                                binop, elem_T)
-                _scf.yield(IR.Value[])
-            end
-            @with_block else_block begin
-                _scf.yield(IR.Value[])
-            end
-            _scf.if_(mask_bit; results=IR.Type[],
-                     thenRegion=then_region, elseRegion=else_region)
-        end
-    end
-    return last_old
-end
 
 # ----------------------------------------------------------------------------
 # Tile load / store
 # ----------------------------------------------------------------------------
 
-function emit_tile_load!(lc::LowerCtx, part::PartitionInfo,
-                         index_components::Vector{Any})
-    idx_t = IR.IndexType()
-    rank = length(part.tile_shape)
-    length(index_components) == rank ||
-        error("tile load: rank mismatch (partition rank=$rank, " *
-              "got $(length(index_components)) indices)")
 
-    # cuTile gives indices and tile_shape in Julia col-major order; MLIR
-    # transfer_read takes indices in row-major (slowest dim first). Build
-    # the offsets in Julia order then reverse for MLIR.
-    offs_julia = IR.Value[]
-    for k in 1:rank
-        bid_v = resolve_value_or_const(lc, index_components[k])
-        bid_v === nothing && error("tile load: cannot resolve index component $k")
-        bid_idx = cast_to_index(bid_v)
-        tile_c = IR.result(_arith.constant(;
-            value=IR.Attribute(part.tile_shape[k], idx_t)))
-        push!(offs_julia, IR.result(_arith.muli(bid_idx, tile_c; result=idx_t)))
-    end
-    offs = rank == 1 ? offs_julia : reverse(offs_julia)
-
-    elem_t = mlir_elem_type(part.elem_type)
-    # MLIR vector shape is row-major (slowest dim first).
-    vec_t = IR.VectorType(rank, reverse(part.tile_shape), elem_t)
-    padding = IR.result(_arith.constant(;
-        value=IR.Attribute(zero(part.elem_type))))
-    perm = IR.Attribute(IR.IdentityAffineMap(rank))
-    inb  = IR.Attribute(IR.Attribute[IR.Attribute(true) for _ in 1:rank])
-    return IR.result(_vector.transfer_read(
-        part.base, offs, padding;
-        vector=vec_t, permutation_map=perm, in_bounds=inb,
-    ))
-end
-
-function emit_tile_store!(lc::LowerCtx, part::PartitionInfo,
-                          value::IR.Value, index_components::Vector{Any})
-    idx_t = IR.IndexType()
-    rank = length(part.tile_shape)
-    offs_julia = IR.Value[]
-    for k in 1:rank
-        bid_v = resolve_value_or_const(lc, index_components[k])
-        bid_v === nothing && error("tile store: cannot resolve index component $k")
-        bid_idx = cast_to_index(bid_v)
-        tile_c = IR.result(_arith.constant(;
-            value=IR.Attribute(part.tile_shape[k], idx_t)))
-        push!(offs_julia, IR.result(_arith.muli(bid_idx, tile_c; result=idx_t)))
-    end
-    offs = rank == 1 ? offs_julia : reverse(offs_julia)
-    perm = IR.Attribute(IR.IdentityAffineMap(rank))
-    inb  = IR.Attribute(IR.Attribute[IR.Attribute(true) for _ in 1:rank])
-    _vector.transfer_write(value, part.base, offs;
-                            permutation_map=perm, in_bounds=inb)
-    return nothing
-end
 
 # ----------------------------------------------------------------------------
 # SPMD-mode plain-Julia op emitters

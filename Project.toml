@@ -4,13 +4,14 @@ version = "0.1.0"
 authors = ["gbaraldi"]
 
 [deps]
+BFloat16s = "ab4f0b2a-ad5b-11e8-123f-65d77653426b"
+EnumX = "4e289a0a-7415-4d19-859d-a7e5c4648b56"
 IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
 LLVMOpenMP_jll = "1d63c593-3942-5779-bab2-d838dc0a180e"
 LLVM_full_jll = "a3ccf953-465e-511d-b87f-60a6490c289d"
 Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
 MLIR = "bfde9dd4-8f40-4a1e-be09-1475335e1c92"
 MLIR_jll = "a70bccb4-a5c0-5e2e-a329-e731972457e8"
-cuTile = "0dea8319-8c4a-4662-a73d-20234d115b9a"
 
 [sources]
 MLIR = {path = "/home/gbaraldi/.julia/dev/MLIR"}
