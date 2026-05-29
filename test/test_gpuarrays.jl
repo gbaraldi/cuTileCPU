@@ -66,5 +66,18 @@ mk(v) = MLIRArray(CUDA.CuArray(v))
         # device↔device copyto! through the backend.
         c = mk(zeros(Float32, n)); copyto!(c, a); CUDA.synchronize()
         @test A(c) == A(a)
+
+        # Base reductions → GPUArrays.mapreducedim! → our single-workgroup
+        # grid-stride reduce kernel (@localmem tree reduce). `count`/`any`/`all`
+        # exercise the Bool→Int width coercion; max/min the new maxnumf/minnumf.
+        @test sum(a) ≈ sum(A(a))
+        @test maximum(a) == maximum(A(a))
+        @test minimum(a) == minimum(A(a))
+        @test sum(abs2, a) ≈ sum(abs2, A(a))
+        @test prod(p) ≈ prod(A(p))
+        @test count(>(0.5f0), a) == count(>(0.5f0), A(a))
+        @test any(>(0.5f0), a) == any(>(0.5f0), A(a))
+        @test all(>(0.0f0), p)
+        @test mapreduce(abs2, +, a) ≈ mapreduce(abs2, +, A(a))
     end
 end

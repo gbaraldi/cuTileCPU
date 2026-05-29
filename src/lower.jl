@@ -1507,7 +1507,7 @@ end
 # `Int32` index widening (`a[gid::Int32]`). All emitters are vector-aware so
 # they work on SPMD lane vectors.
 const _RAW_CORE_INTRINSICS = Set{Symbol}([
-    :add_float, :sub_float, :mul_float, :div_float, :neg_float,
+    :add_float, :sub_float, :mul_float, :div_float, :neg_float, :max_float, :min_float,
     :add_int, :sub_int, :mul_int, :neg_int,
     :and_int, :or_int, :xor_int, :not_int,
     :shl_int, :lshr_int, :ashr_int,
@@ -1655,6 +1655,8 @@ function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecializ
     name === :sub_float && return emit_binop_value!(lc, args, _arith.subf, typ)
     name === :mul_float && return emit_binop_value!(lc, args, _arith.mulf, typ)
     name === :div_float && return emit_binop_value!(lc, args, _arith.divf, typ)
+    name === :max_float && return emit_binop_value!(lc, args, _arith.maxnumf, typ)  # LLVM maxnum
+    name === :min_float && return emit_binop_value!(lc, args, _arith.minnumf, typ)  # LLVM minnum
     name === :add_int   && return emit_binop_value!(lc, args, _arith.addi, typ)
     name === :sub_int   && return emit_binop_value!(lc, args, _arith.subi, typ)
     name === :mul_int   && return emit_binop_value!(lc, args, _arith.muli, typ)

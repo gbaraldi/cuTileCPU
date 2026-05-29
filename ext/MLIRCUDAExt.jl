@@ -83,6 +83,49 @@ Base.similar(bc::Base.Broadcast.Broadcasted{MLIRArrayStyle{N}}, ::Type{T}, dims)
 # erroring. (AcceleratedKernels' block reductions `view` the source.)
 GPUArrays.derive(::Type{T}, a::MLIRArray, osize::Dims, offset::Int) where {T} =
     MLIRArray(GPUArrays.derive(T, a.data, osize, offset))
+
+# ---- reductions ------------------------------------------------------------
+# GPUArrays' Base reductions (sum/prod/maximum/minimum/any/all/count/mapreduce)
+# go through `GPUArrays.mapreducedim!`, which has no generic — each backend
+# implements it. A self-contained single-workgroup grid-stride reduction (no
+# AcceleratedKernels dependency): every lane folds a strided slice into a private
+# accumulator seeded with the neutral element `init`, then a `@localmem` tree
+# reduce collapses the block → `R[1]`. One block covers any `n` via the stride.
+const _REDUCE_BLOCK = 256
+@kernel function _full_reduce_kernel!(R, @Const(A), op, f, init, n)
+    lid = @index(Local, Linear)
+    shared = @localmem eltype(R) (_REDUCE_BLOCK,)
+    acc = init
+    i = lid
+    while i <= n
+        @inbounds acc = op(acc, f(A[i]))
+        i += _REDUCE_BLOCK
+    end
+    @inbounds shared[lid] = acc
+    @synchronize
+    s = _REDUCE_BLOCK ÷ 2
+    while s > 0
+        if lid <= s
+            @inbounds shared[lid] = op(shared[lid], shared[lid + s])
+        end
+        @synchronize
+        s ÷= 2
+    end
+    lid == 1 && (@inbounds R[1] = shared[1])
+end
+
+function GPUArrays.mapreducedim!(f, op, R::MLIRArray,
+                                 A::Union{AbstractArray,Base.Broadcast.Broadcasted};
+                                 init=nothing)
+    init === nothing &&
+        error("MLIRCUDABackend.mapreducedim!: needs an explicit `init` (neutral element)")
+    length(R) == 1 ||
+        error("MLIRCUDABackend.mapreducedim!: only full reductions (dims=:) supported yet")
+    n = length(A)
+    _full_reduce_kernel!(MLIRCUDABackend())(R, A, op, f, init, n;
+        ndrange=_REDUCE_BLOCK, workgroupsize=_REDUCE_BLOCK)
+    return R
+end
 Base.copyto!(d::MLIRArray, s::AbstractArray) = (copyto!(d.data, s); d)
 Base.copyto!(d::AbstractArray, s::MLIRArray) = (copyto!(d, s.data); d)
 Base.copyto!(d::MLIRArray, s::MLIRArray) = (copyto!(d.data, s.data); d)
