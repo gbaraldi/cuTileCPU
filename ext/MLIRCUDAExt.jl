@@ -25,7 +25,8 @@ using LLVM
 using CUDA
 import CUDA_Compiler_jll
 import GPUArrays
-using GPUArraysCore: GPUArraysCore, AbstractGPUArray, AbstractGPUArrayStyle
+import AcceleratedKernels as AK
+using GPUArraysCore: GPUArraysCore, AbstractGPUArray, AbstractGPUArrayStyle, @allowscalar
 
 struct MLIRCUDABackend <: KA.GPU end
 
@@ -87,43 +88,29 @@ GPUArrays.derive(::Type{T}, a::MLIRArray, osize::Dims, offset::Int) where {T} =
 # ---- reductions ------------------------------------------------------------
 # GPUArrays' Base reductions (sum/prod/maximum/minimum/any/all/count/mapreduce)
 # go through `GPUArrays.mapreducedim!`, which has no generic — each backend
-# implements it. A self-contained single-workgroup grid-stride reduction (no
-# AcceleratedKernels dependency): every lane folds a strided slice into a private
-# accumulator seeded with the neutral element `init`, then a `@localmem` tree
-# reduce collapses the block → `R[1]`. One block covers any `n` via the stride.
-const _REDUCE_BLOCK = 256
-@kernel function _full_reduce_kernel!(R, @Const(A), op, f, init, n)
-    lid = @index(Local, Linear)
-    shared = @localmem eltype(R) (_REDUCE_BLOCK,)
-    acc = init
-    i = lid
-    while i <= n
-        @inbounds acc = op(acc, f(A[i]))
-        i += _REDUCE_BLOCK
-    end
-    @inbounds shared[lid] = acc
-    @synchronize
-    s = _REDUCE_BLOCK ÷ 2
-    while s > 0
-        if lid <= s
-            @inbounds shared[lid] = op(shared[lid], shared[lid + s])
-        end
-        @synchronize
-        s ÷= 2
-    end
-    lid == 1 && (@inbounds R[1] = shared[1])
-end
-
+# implements it. Rather than hand-roll a reduction kernel, delegate to
+# AcceleratedKernels' `mapreduce` (a hard dep — backends depending on AK is
+# established, e.g. AMDGPU.jl): it runs on the MLIRCUDABackend and handles both
+# full and dims reductions. A `Broadcasted` input is materialised first
+# (AK.mapreduce wants an `AbstractArray`).
 function GPUArrays.mapreducedim!(f, op, R::MLIRArray,
                                  A::Union{AbstractArray,Base.Broadcast.Broadcasted};
                                  init=nothing)
-    init === nothing &&
-        error("MLIRCUDABackend.mapreducedim!: needs an explicit `init` (neutral element)")
-    length(R) == 1 ||
-        error("MLIRCUDABackend.mapreducedim!: only full reductions (dims=:) supported yet")
-    n = length(A)
-    _full_reduce_kernel!(MLIRCUDABackend())(R, A, op, f, init, n;
-        ndrange=_REDUCE_BLOCK, workgroupsize=_REDUCE_BLOCK)
+    Ain = A isa Base.Broadcast.Broadcasted ? Base.materialize(A) : A
+    # AK derives its `neutral` from the SOURCE eltype, which is wrong for a
+    # type-changing map+reduce (e.g. `count`: Float32 → Bool → Int sum, or
+    # `any`/`all`: Float32 → Bool via `|`/`&`). GPUArrays knows the correct
+    # result-type neutral, so pass both `neutral` and `init` explicitly.
+    neutral = GPUArrays.neutral_element(op, eltype(R))
+    _init = init === nothing ? neutral : init
+    if length(R) == 1
+        @allowscalar R[1] = AK.mapreduce(f, op, Ain; init=_init, neutral=neutral)
+    else
+        rdims = Tuple(d for d in 1:ndims(Ain) if size(R, d) == 1 && size(Ain, d) != 1)
+        length(rdims) == 1 ||
+            error("MLIRCUDABackend.mapreducedim!: only single-dim reductions (got dims=$rdims)")
+        copyto!(R, AK.mapreduce(f, op, Ain; init=_init, neutral=neutral, dims=only(rdims)))
+    end
     return R
 end
 Base.copyto!(d::MLIRArray, s::AbstractArray) = (copyto!(d.data, s); d)

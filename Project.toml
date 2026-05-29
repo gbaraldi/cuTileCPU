@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["gbaraldi"]
 
 [deps]
+AcceleratedKernels = "6a4ca0a5-0e36-4168-a932-d9be78d558f1"
 BFloat16s = "ab4f0b2a-ad5b-11e8-123f-65d77653426b"
 EnumX = "4e289a0a-7415-4d19-859d-a7e5c4648b56"
 IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
@@ -31,6 +32,7 @@ KernelAbstractionsExt = ["KernelAbstractions", "Atomix"]
 MLIRCUDAExt = ["KernelAbstractions", "CUDA", "LLVM", "GPUArrays", "GPUArraysCore", "CUDA_Compiler_jll"]
 
 [compat]
+AcceleratedKernels = "0.4"
 Atomix = "0.1, 1"
 CUDA_Compiler_jll = "0.4"
 GPUArrays = "11"
