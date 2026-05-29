@@ -2541,6 +2541,37 @@ end
             @test occursin("llvm.",         code_gpu(kr, cr, ar, br; ndrange=256, level=:lowered))
             @test occursin("ptx_kernel",    code_gpu(kr, cr, ar, br; ndrange=256, level=:llvm))
             @test occursin(".visible .entry", code_gpu(kr, cr, ar, br; ndrange=256, level=:ptx))
+
+            # Tiled shared-memory matmul: the capstone combining 2-D @localmem
+            # tiles, a k-tile loop with two @synchronize, and a register
+            # accumulator. The inner-product accumulator `out` is LOCAL to each
+            # k-tile (folded into `acc` after the inner loop) — one accumulator
+            # carried through BOTH loop levels trips the structurizer.
+            @eval @kernel function _g_mmtiled!(C, @Const(A), @Const(B))
+                I, J = @index(Global, NTuple); ii, jj = @index(Local, NTuple)
+                tA = @localmem Float32 (16, 16)
+                tB = @localmem Float32 (16, 16)
+                acc = zero(Float32); nkt = size(A, 2) ÷ 16
+                for kt in 1:nkt
+                    kb = (kt - 1) * 16
+                    @inbounds tA[ii, jj] = A[I, kb + jj]
+                    @inbounds tB[ii, jj] = B[kb + ii, J]
+                    @synchronize
+                    out = zero(Float32)
+                    @inbounds for kk in 1:16
+                        out += tA[ii, kk] * tB[kk, jj]
+                    end
+                    acc += out
+                    @synchronize
+                end
+                @inbounds C[I, J] = acc
+            end
+            for nm in (256, 512)
+                Am = CUDA.rand(Float32, nm, nm); Bm = CUDA.rand(Float32, nm, nm)
+                Cm = CUDA.zeros(Float32, nm, nm)
+                (@eval _g_mmtiled!)(GPUB(), (16, 16))(Cm, Am, Bm; ndrange=(nm, nm)); CUDA.synchronize()
+                @test isapprox(Array(Cm), Array(Am) * Array(Bm); rtol=1f-2)  # tiled matmul
+            end
         end
     end
 
