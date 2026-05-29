@@ -27,19 +27,50 @@ using CUDA
 struct MLIRCUDABackend <: KA.GPU end
 
 # ----------------------------------------------------------------------------
-# Backend protocol — allocation/sync defer to CUDA.
+# MLIRArray — the backend's array type.
+# ----------------------------------------------------------------------------
+#
+# A thin wrapper around a CuArray whose `KA.get_backend` returns MLIRCUDABackend.
+# This is what lets backend-agnostic KA code (GPUArrays, AcceleratedKernels) pick
+# our backend automatically: those libraries dispatch on `get_backend(array)`, so
+# wrapping the device array in an MLIRArray routes their `@kernel` launches here.
+# We can't instead define `get_backend(::CuArray)` — that belongs to CUDA.jl's
+# CUDABackend. The wrapper is host-indexable (for verification) and marshals by
+# unwrapping to the inner CuArray.
+struct MLIRArray{T,N} <: AbstractArray{T,N}
+    data::CuArray{T,N}
+end
+
+unwrap(a::MLIRArray) = a.data
+unwrap(@nospecialize(a)) = a
+
+Base.size(a::MLIRArray) = size(a.data)
+Base.getindex(a::MLIRArray, i::Int...) = getindex(a.data, i...)
+Base.setindex!(a::MLIRArray, v, i::Int...) = (setindex!(a.data, v, i...); v)
+Base.IndexStyle(::Type{<:MLIRArray}) = IndexLinear()
+Base.similar(a::MLIRArray, ::Type{T}, dims::Dims) where {T} = MLIRArray(similar(a.data, T, dims))
+Base.similar(::Type{MLIRArray{T}}, dims::Dims) where {T} = MLIRArray(CuArray{T}(undef, dims))
+Base.Array(a::MLIRArray) = Array(a.data)
+Base.pointer(a::MLIRArray) = pointer(a.data)
+Base.copyto!(d::MLIRArray, s::AbstractArray) = (copyto!(d.data, s); d)
+Base.copyto!(d::AbstractArray, s::MLIRArray) = (copyto!(d, s.data); d)
+Base.copyto!(d::MLIRArray, s::MLIRArray) = (copyto!(d.data, s.data); d)
+CUDA.unsafe_free!(a::MLIRArray) = CUDA.unsafe_free!(a.data)
+
+# ----------------------------------------------------------------------------
+# Backend protocol — the backend's native array is MLIRArray; storage defers to
+# CUDA.
 # ----------------------------------------------------------------------------
 
-KA.allocate(::MLIRCUDABackend, ::Type{T}, dims::Tuple) where {T} = CuArray{T}(undef, dims)
-KA.zeros(::MLIRCUDABackend, ::Type{T}, dims::Tuple) where {T} = CUDA.zeros(T, dims)
-KA.ones(::MLIRCUDABackend, ::Type{T}, dims::Tuple) where {T} = CUDA.ones(T, dims)
+KA.get_backend(::MLIRArray) = MLIRCUDABackend()
+KA.allocate(::MLIRCUDABackend, ::Type{T}, dims::Tuple) where {T} = MLIRArray(CuArray{T}(undef, dims))
+KA.zeros(::MLIRCUDABackend, ::Type{T}, dims::Tuple) where {T} = MLIRArray(CUDA.zeros(T, dims))
+KA.ones(::MLIRCUDABackend, ::Type{T}, dims::Tuple) where {T} = MLIRArray(CUDA.ones(T, dims))
 KA.synchronize(::MLIRCUDABackend) = CUDA.synchronize()
 KA.functional(::MLIRCUDABackend) = CUDA.functional()
 KA.supports_atomics(::MLIRCUDABackend) = true
 # Data movement (host↔device, device↔device) defers to CUDA's copyto!.
-KA.copyto!(::MLIRCUDABackend, dst, src) = (Base.copyto!(dst, src); dst)
-# NOTE: no `KA.get_backend(::CuArray)` override — that belongs to CUDA.jl's own
-# CUDABackend. Users opt in explicitly: `k(MLIRCUDABackend(), W)(...; ndrange)`.
+KA.copyto!(::MLIRCUDABackend, dst, src) = (Base.copyto!(unwrap(dst), unwrap(src)); dst)
 
 # ----------------------------------------------------------------------------
 # GPU compilation: SCI → gpu.module → PTX → CuFunction (cached).
@@ -192,9 +223,10 @@ function _marshal(args, kinds)
     flat = Any[]; sig = DataType[]
     for (a, k) in zip(args, kinds)
         if k === :memref
-            a isa CuArray ||
-                error("MLIRCUDABackend: memref param expects a CuArray, got $(typeof(a))")
-            _push_memref!(flat, sig, a)
+            arr = unwrap(a)
+            arr isa CuArray ||
+                error("MLIRCUDABackend: memref param expects a CuArray/MLIRArray, got $(typeof(a))")
+            _push_memref!(flat, sig, arr)
         elseif k === :scalar
             push!(flat, a); push!(sig, typeof(a))
         else
@@ -211,6 +243,7 @@ end
 # Device array types trip scalar-indexing guards during inference; map them to
 # the host `Array` of the same eltype/rank (which lowers identically).
 _host_argtype(::Type{<:CuArray{T,N}}) where {T,N} = Array{T,N}
+_host_argtype(::Type{<:MLIRArray{T,N}}) where {T,N} = Array{T,N}
 _host_argtype(@nospecialize(T::Type)) = T
 
 function _resolve_wgsize(obj::KA.Kernel{MLIRCUDABackend}, workgroupsize)

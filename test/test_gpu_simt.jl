@@ -253,6 +253,17 @@
             Cm = CUDA.zeros(Float32, nm, nm)
             (@eval _g_mmtiled!)(GPUB(), (16, 16))(Cm, Am, Bm; ndrange=(nm, nm)); CUDA.synchronize()
             @test isapprox(Array(Cm), Array(Am) * Array(Bm); rtol=1f-2)  # tiled matmul
+
+            # MLIRArray wrapper: get_backend dispatches to MLIRCUDABackend, so a
+            # KA @kernel runs with no explicit backend (the path backend-agnostic
+            # KA code — GPUArrays / AcceleratedKernels — takes).
+            MLIRArray = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRArray
+            wa = MLIRArray(CUDA.rand(Float32, 1024)); wb = MLIRArray(CUDA.rand(Float32, 1024))
+            wc = MLIRArray(CUDA.zeros(Float32, 1024))
+            @test KernelAbstractions.get_backend(wa) isa GPUB
+            (@eval _g_vadd!)(KernelAbstractions.get_backend(wa), 256)(wc, wa, wb; ndrange=1024)
+            CUDA.synchronize()
+            @test Array(wc) ≈ Array(wa) .+ Array(wb)                    # wrapper auto-dispatch
         end
     end
 end
