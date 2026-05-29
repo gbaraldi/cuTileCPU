@@ -52,9 +52,29 @@ const MLIRArray = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRArray
         foreach_double!(fdst, rsrc); CUDA.synchronize()
         @test Array(fdst) ≈ 2f0 .* (1:n)                  # AK.foreachindex end-to-end
 
-        # Host-copy of a *view* of an MLIRArray must go through the wrapped
-        # CuArray; the generic AbstractArray path scalar-indexes (CUDA's scalar
-        # guard). AK's reduce/scan copy partial results with `Vector(@view ...)`.
-        @test Vector(@view rsrc[3:7]) == Float32[3, 4, 5, 6, 7]
+        # A contiguous view of an MLIRArray materialises (GPUArrays `derive`) to
+        # an MLIRArray sharing storage — copy to host via the wrapped CuArray.
+        @test Array(@view rsrc[3:7]) == Float32[3, 4, 5, 6, 7]
+        # A strided (non-contiguous) view stays a SubArray; its host copy must go
+        # through the wrapped CuArray (the generic path scalar-indexes).
+        @test Vector(@view rsrc[3:2:9]) == Float32[3, 5, 7, 9]
+
+        # sort! — the merge-sort kernel mixes Int32/Int64 indices, exercising the
+        # binop/cmp/select/while width coercion (the merge step's `addi`/`cmpi`
+        # over an `Int32` index and an `Int64` if-result must agree on a type).
+        s = MLIRArray(CUDA.CuArray(collect(Float32, n:-1:1)))
+        AK.sort!(s); CUDA.synchronize()
+        @test issorted(Array(s))                          # AK.sort! end-to-end
+        si = MLIRArray(CUDA.CuArray(rand(Int32(1):Int32(1000), n)))
+        sv = copy(Array(si)); AK.sort!(si); CUDA.synchronize()
+        @test Array(si) == sort(sv)
+
+        # accumulate! exclusive — `if inclusive || iblock != 0 { shift }`, the
+        # short-circuit-`||`-guarded body that needs the IRStructurizer edge
+        # multiplexer (otherwise the shift runs unconditionally → inclusive scan).
+        ex = MLIRArray(CUDA.CuArray(ones(Int32, 16)))
+        AK.accumulate!(+, ex; init=Int32(0), inclusive=false,
+                       block_size=8, alg=AK.ScanPrefixes()); CUDA.synchronize()
+        @test Array(ex) == collect(Int32, 0:15)           # exclusive prefix sum
     end
 end
