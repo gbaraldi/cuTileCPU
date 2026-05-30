@@ -302,9 +302,36 @@ function _compile(f, full_argtypes; sm="sm_90", feat="+ptx80", nd_dims=Int[], op
     bc = _extract_gpu_binary(mod)
     _lmod, ptx = _bitcode_to_ptx(bc; sm, feat)
 
-    cufn = CuFunction(CuModule(ptx), kname)
+    cumod = CuModule(ptx)
+    _wire_exception_flag!(cumod)
+    cufn = CuFunction(cumod, kname)
     _gpu_cache[key] = (cufn, kinds)
     return cufn, kinds
+end
+
+# If the kernel has throws, the lowering emits a module global `@__mlirkernels_exc`
+# holding a pointer to CUDA's per-context `ExceptionInfo`. Point it there: a device
+# throw then sets `status=1`, which CUDA's `check_exceptions()` (run in every
+# `CUDA.synchronize()`) detects and raises a `KernelException` for — reusing
+# CUDA.jl's mature host-side machinery. No global ⇒ kernel can't throw ⇒ no-op.
+function _wire_exception_flag!(cumod::CuModule)
+    g = try
+        CuGlobal{UInt64}(cumod, "__mlirkernels_exc")
+    catch
+        return nothing                      # symbol absent → kernel has no throws
+    end
+    # `create_exceptions!` registers (and zeroes) the per-context ExceptionInfo and
+    # returns the HOST pointer to that host-pinned MEMHOSTALLOC_DEVICEMAP buffer —
+    # NOT the CuPtr from cuMemHostGetDevicePointer. The device dereferences this host
+    # VA directly, which is valid because Unified Virtual Addressing makes it
+    # device-accessible; it's exactly the pointer CUDA.jl threads into its own device
+    # runtime, so we inherit the same UVA requirement as stock CUDA.jl (no new
+    # assumption). `status` is field 0, so our device store of `i32 1` at this base
+    # sets it. `check_exceptions()` (run by every `CUDA.synchronize()`) then raises.
+    # (Exception infra lives in the CUDACore package, reached via `CUDA.CUDACore`.)
+    ptr = CUDA.CUDACore.create_exceptions!(cumod)
+    g[] = UInt64(UInt(ptr))
+    return nothing
 end
 
 # ----------------------------------------------------------------------------

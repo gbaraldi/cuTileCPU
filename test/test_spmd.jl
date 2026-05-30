@@ -83,3 +83,22 @@ end
     end
 end
 
+
+# A throw on the SPMD/CPU path (no gpu.module) lowers to `llvm.intr.trap`, not
+# `nvvm.exit` — the GPU device-exception flag-signal is GPU-only, so the CPU
+# fallback aborts the thread. (Regression for emit_exception!'s CPU branch.)
+function thrower_spmd(a::Vector{Float32}, c::Vector{Float32}, i::Int)
+    x = @inbounds a[i]
+    if x < 0f0
+        throw(DomainError(x, "neg"))
+    end
+    @inbounds c[i] = x + 1f0
+    return
+end
+
+@testset "SPMD: throw lowers to a CPU trap" begin
+    mlir = _ir(MLIRKernels.code_mlir, thrower_spmd,
+        (Vector{Float32}, Vector{Float32}, Int); lane_width=16)
+    @test occursin("llvm.intr.trap", mlir)     # CPU fallback
+    @test !occursin("nvvm.exit", mlir)         # not the GPU signal path
+end

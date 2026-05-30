@@ -110,6 +110,13 @@ effect-free (stores/atomics/markers). Falls back to the statement-level
 function inst_must_keep(block::Block, inst::Instruction)
     s = inst[:stmt]
     s isa ReturnNode && return true
+    # A non-returning call (result type `Union{}` = `Bottom`, i.e. a `throw`/error
+    # path) MUST be kept: it diverges, so removing it erases the exception (and
+    # would let the unreachable code after it execute). Inference often flags it
+    # effect-free (no memory effect), which would otherwise drop it. Its operands
+    # (the error object) are kept for SSA validity; the GPU walker no-ops the
+    # Exception-object construction and lowers the throw itself to a flag-signal.
+    inst[:type] === Union{} && return true
     if s isa Expr
         call = resolve_call(block, s)
         if call !== nothing

@@ -208,6 +208,31 @@ end
     @inbounds out[i] = _g_poly(a[i])
 end
 
+# Explicit device throw: a negative element raises a `DomainError` (typed `Union{}`
+# → `emit_exception!` signals CUDA's per-context exception flag, which the host's
+# `check_exceptions()` turns into a `KernelException`). A non-negative input runs
+# clean — no false exception. `@inbounds` so only the explicit throw is in play.
+@kernel function _g_throw!(out, @Const(a))
+    i = @index(Global, Linear)
+    x = @inbounds a[i]
+    if x < 0f0
+        throw(DomainError(x, "negative"))
+    end
+    @inbounds out[i] = x + 1f0
+end
+
+# A value-returning @noinline helper whose `return` is inside a conditional branch
+# (here one arm throws) is unsupported — the live `return` can't be a func.return
+# inside an scf.if region. It must error CLEANLY at compile, NOT emit a duplicate
+# `@__mlirkernels_exc` global (the exception-global dedup must be shared across the
+# kernel + outlined-func lowering contexts) nor silently drop the return value via
+# a poison func.return. Regression for both.
+@noinline _g_thrhelper(x::Float32) = x < 0f0 ? throw(DomainError(x, "neg")) : x * x
+@kernel function _g_outthrow!(out, @Const(a))
+    i = @index(Global, Linear)
+    @inbounds out[i] = _g_thrhelper(a[i])
+end
+
 @testset "GPU: KA @kernel on MLIRCUDABackend (SIMT)" begin
     if !CUDA.functional()
         @info "CUDA not functional in this env — skipping GPU backend test"
@@ -375,6 +400,29 @@ end
         ox = rand(Float32, 64); oa = MLIRArray(CUDA.CuArray(ox)); oo = MLIRArray(CUDA.zeros(Float32, 64))
         _g_outline!(backend, 64)(oo, oa; ndrange=64); CUDA.synchronize()
         @test Array(oo) ≈ ox .^ 2 .+ 2 .* ox .+ 1
+
+        # Device exceptions: an explicit `throw` reaches the host as a
+        # `KernelException` (via CUDA's per-context exception flag), while valid
+        # input never raises a false exception.
+        let N = 256
+            good = MLIRArray(CUDA.CuArray(rand(Float32, N) .+ 1f0))   # all > 0
+            tgo = MLIRArray(CUDA.zeros(Float32, N))
+            _g_throw!(backend, 64)(tgo, good; ndrange=N); CUDA.synchronize()
+            @test Array(tgo) ≈ Array(good) .+ 1f0                    # no false throw
+            badv = rand(Float32, N) .+ 1f0; badv[123] = -5f0          # one negative
+            bad = MLIRArray(CUDA.CuArray(badv)); tbo = MLIRArray(CUDA.zeros(Float32, N))
+            @test_throws CUDA.CUDACore.KernelException begin
+                _g_throw!(backend, 64)(tbo, bad; ndrange=N); CUDA.synchronize()
+            end
+        end
+
+        # A value-returning @noinline helper that throws → clean COMPILE error
+        # (value `return` inside a conditional branch), not a duplicate-global
+        # crash or a silent miscompile. Lowering to :mlir is enough to trigger it.
+        let oa = MLIRArray(CUDA.zeros(Float32, 64))
+            @test_throws "conditional branch" code_gpu(devnull, _g_outthrow!(backend, 64),
+                MLIRArray(CUDA.zeros(Float32, 64)), oa; ndrange=64, level=:mlir)
+        end
     end
 end
 

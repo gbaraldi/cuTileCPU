@@ -29,6 +29,7 @@ const _vector = Dialects.vector
 const _math   = Dialects.math
 const _gpu    = Dialects.gpu
 const _llvm   = Dialects.llvm
+const _nvvm   = Dialects.nvvm
 
 # ----------------------------------------------------------------------------
 # Lowering context
@@ -56,8 +57,14 @@ mutable struct OutlineState
     funcs::Dict{Any, String}
     queue::Vector{Tuple{Any, String}}
     counter::Int
+    # Whether the `@__mlirkernels_exc` module global has been emitted yet. Lives
+    # here (not on LowerCtx) because every outlined-func ctx SHARES this one
+    # OutlineState (`cl.outline = lc.outline`) and the SAME gpu.module block — so a
+    # throw in the kernel body and a throw in an outlined callee must dedup against
+    # each other, or two `llvm.mlir.global @__mlirkernels_exc` ops collide.
+    exc_global::Bool
 end
-OutlineState() = OutlineState(Dict{Any, String}(), Tuple{Any, String}[], 0)
+OutlineState() = OutlineState(Dict{Any, String}(), Tuple{Any, String}[], 0, false)
 
 mutable struct LowerCtx
     ctx::IR.Context
@@ -151,7 +158,9 @@ mutable struct LowerCtx
     # `captured`); using the WHOLE arg as a value reconstructs the vector from
     # those scalar slots (see `resolve_value_or_const`).
     struct_arg_types::Dict{Int, Type}
-    # Outlined-call worklist (shared across kernel + outlined funcs).
+    # Outlined-call worklist (shared across kernel + outlined funcs). Also carries
+    # the `@__mlirkernels_exc`-emitted flag (`outline.exc_global`), shared so the
+    # exception global is emitted exactly once across the kernel + all outlined funcs.
     outline::OutlineState
 end
 
@@ -1145,7 +1154,8 @@ end
 function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
                      yield_types::Vector{Type}=Type[],
                      carried_types::Vector{IR.Type}=IR.Type[],
-                     func_ret_type::Vector{IR.Type}=IR.Type[])
+                     func_ret_type::Vector{IR.Type}=IR.Type[],
+                     @nospecialize(func_ret_jtype=nothing))
     for (idx, entry) in block
         stmt = entry.stmt
         typ  = entry.type
@@ -1179,6 +1189,23 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
             # domain guard in `hypot`). `scf.if` requires both branches to yield
             # the IfOp's results, but this path is dead (it returned), so yield
             # poison matching the result arity (empty when the IfOp has none).
+            # BUT a *live* `return <value>` inside a branch (not a dead/throw path)
+            # can't be expressed — an scf.if region must end in scf.yield, not
+            # func.return. This is how the structurizer represents a value-returning
+            # OUTLINED func whose body is a conditional (with or without a throw):
+            # `f(x) = x<0 ? throw(…) : x*x` and even `f(x) = x>0 ? x : -x` both become
+            # an `if -> Nothing` whose branches each `return`. Erroring (cleanly,
+            # here) beats silently dropping the value or a cryptic later func.return
+            # arity failure. Inline the helper, or compute the result and `return` it
+            # through a single tail. (A general gap: outlined value-returning
+            # conditional helpers are unsupported — see test/`_g_outline!`, the only
+            # supported shape is straight-line.)
+            if isdefined(term, :val) && resolve_value_or_const(lc, term.val) !== nothing
+                error("MLIRKernels: a value `return` inside a conditional branch of an " *
+                      "outlined function is unsupported (it can't become a func.return " *
+                      "inside an scf.if region). Inline the helper, or restructure it to " *
+                      "return through a single tail.")
+            end
             _scf.yield(IR.Value[undef_value(lc, T) for T in yield_types])
             return
         elseif term isa YieldOp
@@ -1258,19 +1285,45 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
         if term isa Core.ReturnNode && isdefined(term, :val)
             rv = resolve_value_or_const(lc, term.val)
             if rv === nothing
-                _func.return_(IR.Value[])
+                # The return value didn't resolve — this is a dead post-throw path
+                # (the `Union{}` throw was lowered to a flag-signal + `nvvm.exit`, so
+                # control never reaches here). A value-returning func still needs a
+                # `func.return` of the right arity, so yield poison of the return
+                # type (mirrors the scf.if dead-branch poison-yield).
+                if isempty(func_ret_type)
+                    _func.return_(IR.Value[])
+                else
+                    _func.return_(IR.Value[undef_value(lc, func_ret_jtype)])
+                end
             else
                 isempty(func_ret_type) || (rv = _coerce_to_type!(rv, func_ret_type[1]))
                 _func.return_(IR.Value[rv])
             end
-        else
+        elseif isempty(func_ret_type)
             _func.return_(IR.Value[])
+        else
+            _func.return_(IR.Value[undef_value(lc, func_ret_jtype)])
         end
         return
     end
 end
 
 function walk_stmt!(lc::LowerCtx, idx::Int, @nospecialize(stmt), @nospecialize(typ))
+    # An exception-object construction (`DomainError(x)`, `BoundsError(a,i)`, …):
+    # it only feeds a `throw`, which we lower to a flag-signal (see
+    # `emit_exception!`) WITHOUT the object. Never materialise it on the GPU —
+    # the constructor would otherwise hit the outlined-call / struct paths and
+    # fail. (Kept through DCE for SSA validity; here it's a no-op.) `widenconst`
+    # because the construct is typed `Core.PartialStruct(DomainError,…)`. NOTE: this
+    # keys off the value TYPE alone, so it assumes the exception is only ever
+    # thrown; a non-throw USE (reading a field, storing it) would leave this SSA
+    # unbound and the consumer would error — but constructing an exception for any
+    # purpose other than `throw` is unsupported on the SIMT path anyway. (`Union{}`
+    # is the throw call itself, not a construction, and `Union{} isa DataType` is
+    # already false, so it's naturally excluded.)
+    let wt = Core.Compiler.widenconst(typ)
+        wt isa DataType && wt <: Exception && return nothing
+    end
     if stmt isa Expr
         return walk_expr!(lc, idx, stmt, typ)
     elseif stmt isa Core.ReturnNode
@@ -1529,6 +1582,72 @@ function materialise_const(lc::LowerCtx, @nospecialize(c))
 end
 
 
+# Memory-effect mnemonics that, if present anywhere in a `llvmcall`'s IR text,
+# make it unsafe to elide even as an `@llvm.assume` hint — we error instead of
+# silently dropping the effect.
+const _LLVMCALL_EFFECT_TOKENS = ("store", "fence", "asm", "atomicrmw", "cmpxchg",
+                                 "memset", "memcpy", "memmove", "volatile")
+
+# The IR text of a `llvmcall`'s first operand — a `(declarations, entry)` tuple
+# (commonly `Core.tuple(decls, "entry")`) or a bare IR string. Returns the
+# declarations string (which carries the `@llvm.assume` / intrinsic decls) or
+# `nothing` if it can't be resolved to a literal string.
+function _llvmcall_ir_string(lc::LowerCtx, @nospecialize(op))
+    op isa String && return op
+    op isa Tuple && !isempty(op) && op[1] isa String && return op[1]
+    if op isa SSAValue && haskey(lc.tuples, op.id)
+        comps = lc.tuples[op.id]
+        return (!isempty(comps) && comps[1] isa String) ? comps[1] : nothing
+    end
+    c = resolve_const(lc, op)
+    c isa Tuple && !isempty(c) && c[1] isa String && return c[1]
+    c isa String && return c
+    return nothing
+end
+
+# Signal a GPU exception the way CUDA.jl does (NOT a bare trap, which would mask
+# the diagnostic with a sticky CUDA error): set `status=1` in CUDA's per-context
+# `ExceptionInfo` (so the host's `check_exceptions()`, run on every
+# `CUDA.synchronize()`, raises a `KernelException`), then `nvvm.exit` for a clean
+# thread halt. The buffer's (UVA-valid host) pointer is held in the module global
+# `@__mlirkernels_exc` (an `i64`), which the host writes at module-creation. The
+# global is emitted once per module, on the first throw (deduped via
+# `lc.outline.exc_global`, shared across the kernel + all outlined funcs). See
+# [[reference_outlined_call_design]] (sibling device-side mechanism) and the
+# CUDA.jl exception research.
+const _EXC_GLOBAL = "__mlirkernels_exc"
+function emit_exception!(lc::LowerCtx)
+    i64 = IR.Type(Int64)
+    if lc.gpu_module_block === nothing
+        # CPU/SPMD path: no CUDA per-context exception buffer to signal. Fall back
+        # to a plain trap (abort) — an unrecoverable kernel error halts the thread.
+        _llvm.intr_trap()
+        return nothing
+    end
+    if !lc.outline.exc_global
+        @with_block lc.gpu_module_block begin
+            _llvm.mlir_global(; global_type=i64,
+                sym_name=IR.Attribute(_EXC_GLOBAL),
+                linkage=parse(IR.Attribute, "#llvm.linkage<external>"),
+                value=IR.Attribute(0, i64), addr_space=IR.Attribute(1, IR.Type(Int32)),
+                initializer=IR.Region())
+        end
+        lc.outline.exc_global = true
+    end
+    # ptr = load @__mlirkernels_exc  (the UVA-valid pointer to CUDA's ExceptionInfo)
+    addr = IR.result(_llvm.mlir_addressof(; res=_llvm_ptr_type(1),
+                     global_name=parse(IR.Attribute, "@" * _EXC_GLOBAL)))
+    pv = IR.result(_llvm.load(addr; res=i64))
+    eptr = IR.result(_llvm.inttoptr(pv; res=_llvm_ptr_type(0)))
+    # info.status = 1 (field 0). Plain store: all throwing threads write the same
+    # value, so no torn write / atomic needed. Host visibility is guaranteed by
+    # the post-kernel `cuCtxSynchronize` that precedes `check_exceptions()`.
+    one = IR.result(_arith.constant(; value=IR.Attribute(1, IR.Type(Int32)), result=IR.Type(Int32)))
+    _llvm.store(one, eptr)
+    _nvvm.exit()
+    return nothing
+end
+
 function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
                     args::Vector{Any}, @nospecialize(typ); mi=nothing)
     fname = callee_name(callee)
@@ -1539,6 +1658,24 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
 
     elseif fname === :getfield
         return emit_getfield!(lc, idx, args, typ)
+
+    elseif fname === :llvmcall
+        # Embedded LLVM IR. We can only safely handle `@llvm.assume` — an advisory
+        # index-bounds hint (`LLVM.Interop.assume`, e.g. from GPUArrays' permutedims)
+        # whose IR is a no-op `call void @llvm.assume(i1 …)` returning void. Elide
+        # it (like bounds checks / throws — advisory, sound to drop). ANY other
+        # llvmcall (a fence, inline-asm store, prefetch, value-returning op) is
+        # NOT safe to drop — error so it's noticed rather than silently miscompiled.
+        # Elide only when the blob mentions `@llvm.assume` AND carries no memory
+        # effect: if an effectful op appears (even alongside an assume) we fall
+        # through to error() rather than silently dropping its effect.
+        ir = _llvmcall_ir_string(lc, args[1])
+        if typ === Nothing && ir !== nothing && occursin("@llvm.assume", ir) &&
+           !any(t -> occursin(t, ir), _LLVMCALL_EFFECT_TOKENS)
+            return nothing
+        end
+        error("MLIRKernels: unsupported llvmcall (only a void @llvm.assume hint is " *
+              "elided): $(ir === nothing ? args[1] : first(ir, 100))")
 
     end
 
@@ -1577,17 +1714,24 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
             # is fully recoverable from args[2:end]; we emit it directly and
             # the bogus "throw" never happens (we replace it with the RMW).
             return emit_spmd_atomic_modifyindex!(lc, args[2:end], typ)
-        elseif fname === :throw || fname === :throw_complex_domainerror ||
-               fname === :throw_inexacterror || fname === :throw_overflowerror ||
-               fname === :_throw_dmrs
-            # Dead inside elided bounds-check IfOps; if we hit it here the
-            # walker is processing a live throw, which the SPMD MVP doesn't
-            # support. `throw_complex_domainerror` is the guard `Base.sqrt`
-            # emits for negative inputs (`sqrt(x<0)`); on the lane-vector path
-            # the compare is varying so the throw can't be hoisted out — and
-            # the kernel author has opted into the math.sqrt (NaN-on-negative)
-            # semantics anyway. Drop it (LLVM end gets a no-op).
+        elseif fname === :throw_complex_domainerror
+            # The guard `Base.sqrt`/`log` emit for out-of-domain inputs. We use the
+            # `math.*` NaN-on-domain semantics (the kernel author opts into this),
+            # so elide the throw — NaN, not a trap (matches device math idiom).
             return nothing
+        elseif typ === Union{}
+            # A non-returning call. Almost always a real throw — BoundsError
+            # (`throw_boundserror`, which is otherwise an "unhandled callee" for
+            # non-`@inbounds` kernels), InexactError, OverflowError, an explicit
+            # `throw`, `error`, … Signal a GPU exception (set CUDA's per-context flag
+            # + clean `nvvm.exit`) so the host raises a `KernelException` on its next
+            # `CUDA.synchronize()`, instead of silent UB. The enclosing scf.if branch
+            # then yields poison (dead after the exit). NOTE: a few non-throwing
+            # noreturn calls are also `Union{}`-typed (infinite recursion `g(x)=g(x)`,
+            # `rethrow()`); they too get reported as a KernelException. That's an
+            # acceptable best-effort diagnostic — halting such a thread is the right
+            # behavior, only the label is imprecise.
+            return emit_exception!(lc)
         end
     end
 
@@ -1915,7 +2059,7 @@ function _emit_outlined_func!(lc::LowerCtx, @nospecialize(mi), sym::String)
         for (k, slot) in enumerate(param_slots)
             cl.arg_vals[slot] = IR.argument(entry, k)
         end
-        walk_block!(cl, sci.entry; kind=:func, func_ret_type=ret_ts)
+        walk_block!(cl, sci.entry; kind=:func, func_ret_type=ret_ts, func_ret_jtype=rt)
     end
     return nothing
 end
@@ -2881,6 +3025,17 @@ function emit_if!(lc::LowerCtx, idx::Int, op::IfOp, @nospecialize(typ))
     # Their condition resolves to the `:boundscheck` sentinel (no Value).
     # We assume `@inbounds` and skip the entire IfOp — its then-branch is
     # the actual bounds check (compare + throw), its else-branch is empty.
+    # (Enabling these checks — driving the condition `true` so OOB → a real
+    # `KernelException` — is a worthwhile follow-up, but: (1) `@inbounds` is not
+    # honored here so checks would be always-on; (2) a throw inside a loop makes
+    # the check's throw-branch terminate in a `BreakOp`, which `walk_block!(:if)`
+    # can't yet lower (needs loop-control integration — matmul-style kernels fail,
+    # though 1-D/2-D non-loop ones work); (3) the exception buffer is per-context
+    # and shared across modules, and `check_exceptions()` clears it on detection —
+    # so a false throw's `status=1` is observed by ANY intervening `synchronize()`
+    # on that context, surfacing a spurious `KernelException` (possibly attributed
+    # to an unrelated kernel). So it stays off; EXPLICIT throws still signal via
+    # `emit_exception!`.)
     if lc.spmd && op.condition isa SSAValue &&
        get(lc.sentinels, op.condition.id, nothing) === :boundscheck
         return nothing
