@@ -116,6 +116,22 @@ mk(v) = MLIRArray(CUDA.CuArray(v))
         @test A(extrema(m2; dims=2)) == extrema(M2; dims=2)
         ei = mk(rand(Int32(1):Int32(99), 1500))
         @test extrema(ei) == extrema(A(ei))
+
+        # findmax/argmax/findfirst reduce with a HETEROGENEOUS `(value,index)`
+        # accumulator — `Tuple{Float32,Int64}` (or `Tuple{Bool,Int64}`). That can't
+        # be a `vector<N×T>`; it lowers via the MLIR `llvm` dialect (`!llvm.struct`
+        # register values + `!llvm.ptr`/getelementptr/load/store for the AoS array,
+        # since `memref` can't hold an aggregate). `fpiseq` backs the isequal tie-break.
+        fx = mk(rand(Float32, 2000)); FX = A(fx)
+        @test findmax(fx) == findmax(FX)
+        @test findmin(fx) == findmin(FX)
+        @test argmax(fx) == argmax(FX)
+        @test argmin(fx) == argmin(FX)
+        @test findfirst(>(0.99f0), fx) == findfirst(>(0.99f0), FX)
+        fi = mk(rand(Int32(1):Int32(999), 1500))
+        @test argmax(fi) == argmax(A(fi))            # heterogeneous Tuple{Int32,Int64}
+        fd = mk(rand(Float64, 777))
+        @test findmin(fd) == findmin(A(fd))          # Tuple{Float64,Int64}
     end
 end
 

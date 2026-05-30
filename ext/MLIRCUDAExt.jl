@@ -99,10 +99,12 @@ function GPUArrays.mapreducedim!(f, op, R::MLIRArray,
     Ain = A isa Base.Broadcast.Broadcasted ? Base.materialize(A) : A
     # AK derives its `neutral` from the SOURCE eltype, which is wrong for a
     # type-changing map+reduce (e.g. `count`: Float32 → Bool → Int sum, or
-    # `any`/`all`: Float32 → Bool via `|`/`&`). GPUArrays knows the correct
-    # result-type neutral, so pass both `neutral` and `init` explicitly.
-    neutral = GPUArrays.neutral_element(op, eltype(R))
-    _init = init === nothing ? neutral : init
+    # `any`/`all`: Float32 → Bool via `|`/`&`). Pass `neutral` explicitly. When
+    # the caller gives an explicit `init` (e.g. `findmax`/`argmax` seed their own
+    # `(value,index)` identity, for which `neutral_element` isn't defined), use
+    # it as the neutral too; otherwise ask GPUArrays for the result-type neutral.
+    _init = init === nothing ? GPUArrays.neutral_element(op, eltype(R)) : init
+    neutral = _init
     if length(R) == 1
         @allowscalar R[1] = AK.mapreduce(f, op, Ain; init=_init, neutral=neutral)
     else

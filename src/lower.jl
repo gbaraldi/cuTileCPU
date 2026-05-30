@@ -28,6 +28,7 @@ const _scf    = Dialects.scf
 const _vector = Dialects.vector
 const _math   = Dialects.math
 const _gpu    = Dialects.gpu
+const _llvm   = Dialects.llvm
 
 # ----------------------------------------------------------------------------
 # Lowering context
@@ -174,10 +175,46 @@ function _struct_vec_info(@nospecialize(T))
     return (length(fts), ft)
 end
 
+# A heterogeneous bits-struct (mixed scalar field types, e.g. `Tuple{Float32,Int64}`
+# from `findmax`'s (value,index) pair) can't be a `vector<N×T>`. Its VALUE is an
+# `!llvm.struct<(...)>` (built/read with llvm.insert/extractvalue); in memory it
+# rides in a `memref<?xiN>` byte-carrier (N = 8·sizeof) — memref can't hold an
+# aggregate — accessed via an `!llvm.ptr` + `llvm.getelementptr`/load/store. Scalar
+# fields only (no nested aggregates yet). Returns `fieldcount` or `nothing`.
+# Design: see the `reference_hetero_struct_design` memory note (llvm-dialect plan).
+function _hetero_struct_info(@nospecialize(T))
+    (T isa DataType && isconcretetype(T) && isstructtype(T) && isbitstype(T)) || return nothing
+    _struct_vec_info(T) === nothing || return nothing   # homogeneous → vector path
+    fc = fieldcount(T)
+    fc >= 1 || return nothing
+    for i in 1:fc
+        FT = fieldtype(T, i)
+        (FT isa Type && (FT <: Number || FT === Bool) && isbitstype(FT)) || return nothing
+    end
+    return fc
+end
+
+# Signless MLIR integer of an arbitrary bit width (the `iN` struct byte-carrier).
+_int_type(width::Int) = IR.Type(MLIR.API.mlirIntegerTypeGet(IR.current_context(), width))
+
+# `!llvm.struct<(field types…)>` for a heterogeneous bits-struct. Unpacked literal
+# struct — its field offsets/padding match Julia's layout (verified for the
+# scalar-field case, e.g. `Tuple{Float32,Int64}` = {f32@0, i64@8}).
+function _llvm_struct_type(@nospecialize(T))
+    refs = MLIR.API.MlirType[mlir_elem_type(fieldtype(T, i)).ref for i in 1:fieldcount(T)]
+    return IR.Type(MLIR.API.mlirLLVMStructTypeLiteralGet(
+        IR.current_context(), length(refs), refs, false))
+end
+
+# `!llvm.ptr<addrspace>` (NVVM: global=1, workgroup/shared=3, generic=0).
+_llvm_ptr_type(addrspace::Int=0) =
+    IR.Type(MLIR.API.mlirLLVMPointerTypeGet(IR.current_context(), addrspace))
+
 function mlir_elem_type(T::Type)
     let si = _struct_vec_info(T)
         si === nothing || return IR.VectorType(1, Int[si[1]], mlir_elem_type(si[2]))
     end
+    _hetero_struct_info(T) === nothing || return _llvm_struct_type(T)
     T === Float32  && return IR.Type(Float32)
     T === Float64  && return IR.Type(Float64)
     T === Float16  && return IR.Type(Float16)
@@ -194,6 +231,16 @@ function mlir_elem_type(T::Type)
     T === UInt64   && return IR.Type(Int64)
     T === Bool     && return IR.Type(Bool)
     error("MLIRKernels: unsupported element type $T")
+end
+
+# Element type for a MEMREF carrier. Identical to `mlir_elem_type` except a
+# heterogeneous struct uses an `iN` byte-carrier (`memref` can't hold an
+# `!llvm.struct`); the struct value itself is loaded/stored via the `llvm` dialect
+# on a pointer derived from this memref. `iN` keeps the descriptor's element
+# stride (= sizeof bytes) consistent with the host `Array{T}` AoS layout.
+function mlir_memref_elem_type(T::Type)
+    _hetero_struct_info(T) === nothing || return _int_type(8 * sizeof(T))
+    return mlir_elem_type(T)
 end
 
 # Build a splat DenseElements attribute for a vector type. The MLIR wrapper
@@ -736,6 +783,54 @@ end
 # in `lc.captured`, so the walker can resolve `getfield(arg, :field)`; nested
 # leaves get params (for marshalling consistency) but aren't directly addressed.
 # Returns the updated synthetic-slot counter.
+# Build a heterogeneous struct VALUE (`!llvm.struct`) from its field Values, in
+# order, via `llvm.mlir.undef` + `llvm.insertvalue`. The struct type is the
+# literal struct of the field value types — which matches `_llvm_struct_type(T)`
+# whenever the fields were resolved from a `T`-typed tuple/`:new` (so the value
+# stored to memory has the right layout).
+function _llvm_struct_assemble!(field_vals::Vector{IR.Value})
+    refs = MLIR.API.MlirType[IR.type(v).ref for v in field_vals]
+    st = IR.Type(MLIR.API.mlirLLVMStructTypeLiteralGet(
+        IR.current_context(), length(refs), refs, false))
+    acc = IR.result(_llvm.mlir_undef(; res=st))
+    for (k, v) in enumerate(field_vals)
+        acc = IR.result(_llvm.insertvalue(acc, v; res=st, position=IR.Attribute(Int64[k - 1])))
+    end
+    return acc
+end
+
+# NVVM address space of a memref's memory-space attribute (global=1,
+# workgroup/shared=3, none/default=0) — to type the derived `!llvm.ptr`.
+function _memref_addrspace(base::IR.Value)
+    ms = MLIR.API.mlirMemRefTypeGetMemorySpace(IR.type(base))
+    ms.ptr == C_NULL && return 0
+    s = string(IR.Attribute(ms))
+    occursin("workgroup", s) && return 3
+    occursin("global", s) && return 1
+    return 0
+end
+
+# `!llvm.ptr` to element `idx0` (0-based integer Value) of a heterogeneous-struct
+# array whose bytes ride in `base` (a `memref<?xiN>`). Bridges memref→llvm:
+# extract the aligned pointer, `inttoptr`, then `getelementptr` by element index
+# with the struct as `elem_type` (stride = sizeof struct). Returns (elem_ptr, structT).
+function _hetero_elem_ptr!(base::IR.Value, idx0::IR.Value, @nospecialize(T))
+    ptr_t = _llvm_ptr_type(_memref_addrspace(base))
+    pidx = IR.result(_memref.extract_aligned_pointer_as_index(base; aligned_pointer=IR.IndexType()))
+    pi64 = IR.result(_arith.index_cast(pidx; out=IR.Type(Int64)))
+    ptr  = IR.result(_llvm.inttoptr(pi64; res=ptr_t))
+    # GEP wants an integer index; normalise the (signed) Julia index to i64.
+    i64t = IR.Type(Int64)
+    gi = IR.type(idx0) == IR.IndexType() ? IR.result(_arith.index_cast(idx0; out=i64t)) :
+         _int_width(IR.type(idx0)) == 64 ? idx0 :
+         IR.result(_arith.extsi(idx0; out=i64t))
+    st = _llvm_struct_type(T)
+    ep = IR.result(_llvm.getelementptr(ptr, IR.Value[gi];
+        res=ptr_t, elem_type=st,
+        rawConstantIndices=IR.Attribute(Int32[typemin(Int32)])))
+    return ep, st
+end
+
 function _flatten_struct_arg!(lc::LowerCtx, @nospecialize(T), arg_slot::Int,
                               path::Tuple, syn::Int, param_mlir_types,
                               param_arg_slots, param_julia_types, param_kinds,
@@ -747,7 +842,7 @@ function _flatten_struct_arg!(lc::LowerCtx, @nospecialize(T), arg_slot::Int,
         leaf = (path..., fn)
         if FT <: DenseArray
             syn -= 1
-            mrc = IR.MemRefType(mlir_elem_type(eltype(FT)),
+            mrc = IR.MemRefType(mlir_memref_elem_type(eltype(FT)),
                                 fill(Int(IR.dynsize()), ndims(FT)),
                                 IR.Attribute(), global_attr)
             push!(param_mlir_types, mrc); push!(param_arg_slots, syn)
@@ -770,13 +865,14 @@ function _flatten_struct_arg!(lc::LowerCtx, @nospecialize(T), arg_slot::Int,
     return syn
 end
 
-# Rebuild a homogeneous-struct arg (flattened to scalar params at synthetic
-# slots) into a `vector<N×T>` value via `vector.from_elements`. Each field
-# `fn` of `T` was registered in `captured[(slot, (fn,))]` as a scalar param;
-# gather them in field order. Returns `nothing` if any field isn't a resolved
-# scalar param (caller falls through).
+# Rebuild a struct arg (flattened to scalar params at synthetic slots) into a
+# whole value: homogeneous → `vector<N×T>` (`vector.from_elements`); heterogeneous
+# → `!llvm.struct` (`_llvm_struct_assemble!`). Each field `fn` of `T` was
+# registered in `captured[(slot, (fn,))]` as a scalar param; gather in field
+# order. Returns `nothing` if any field isn't a resolved scalar param.
 function _reconstruct_struct_arg!(lc::LowerCtx, slot::Int, @nospecialize(T))
-    _struct_vec_info(T) === nothing && return nothing
+    homo = _struct_vec_info(T) !== nothing
+    (homo || _hetero_struct_info(T) !== nothing) || return nothing
     elems = IR.Value[]
     for fn in fieldnames(T)
         ck = get(lc.captured, (slot, (fn,)), nothing)
@@ -787,7 +883,8 @@ function _reconstruct_struct_arg!(lc::LowerCtx, slot::Int, @nospecialize(T))
         v === nothing && return nothing
         push!(elems, v)
     end
-    return IR.result(_vector.from_elements(elems; result=mlir_elem_type(T)))
+    return homo ? IR.result(_vector.from_elements(elems; result=mlir_elem_type(T))) :
+                  _llvm_struct_assemble!(elems)
 end
 
 function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
@@ -861,7 +958,7 @@ function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
                     eT = eltype(AT_wide)
                     N  = ndims(AT_wide)
                     shape = fill(Int(IR.dynsize()), N)
-                    mr = IR.MemRefType(mlir_elem_type(eT), shape,
+                    mr = IR.MemRefType(mlir_memref_elem_type(eT), shape,
                                        IR.Attribute(), global_attr)
                     push!(param_mlir_types, mr)
                     push!(param_arg_slots, i)
@@ -882,11 +979,13 @@ function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
                     # recursively flatten captured fields into their own params.
                     (isstructtype(AT_wide) && !isempty(fieldnames(AT_wide))) ||
                         error("MLIRKernels GPU: unsupported arg type $AT_wide at slot $i")
-                    # A homogeneous-struct arg (e.g. a `Tuple{T,T}` reduction
-                    # init) is `vector<N×T>`-able — record its type so a
-                    # whole-value use reconstructs the vector from the flattened
-                    # scalar slots.
-                    _struct_vec_info(AT_wide) !== nothing && (lc.struct_arg_types[i] = AT_wide)
+                    # A bits-struct arg (e.g. a reduction init `Tuple{T,T}` or
+                    # findmax's `(value,index)::Tuple{Float32,Int64}`) — record its
+                    # type so a whole-value use reconstructs the `vector<N×T>`
+                    # (homogeneous) / `!llvm.struct` (heterogeneous) from the
+                    # flattened scalar field slots.
+                    (_struct_vec_info(AT_wide) !== nothing ||
+                     _hetero_struct_info(AT_wide) !== nothing) && (lc.struct_arg_types[i] = AT_wide)
                     syn_counter = _flatten_struct_arg!(lc, AT_wide, i, (),
                         syn_counter, param_mlir_types, param_arg_slots,
                         param_julia_types, param_kinds, global_attr)
@@ -980,7 +1079,8 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
             lc.ssa_vals[idx] = v
             # Tag homogeneous-struct values (a `vector<N×T>`) so `getfield`
             # extracts the right lane; propagates through any op via its SCI type.
-            typ isa Type && _struct_vec_info(typ) !== nothing && (lc.struct_vals[idx] = typ)
+            typ isa Type && (_struct_vec_info(typ) !== nothing ||
+                _hetero_struct_info(typ) !== nothing) && (lc.struct_vals[idx] = typ)
         end
     end
     # Terminator
@@ -1215,18 +1315,20 @@ end
 function resolve_value_or_const(lc::LowerCtx, @nospecialize(op))
     v = resolve_value(lc, op)
     v === nothing || return v
-    # A homogeneous-struct `:new` used as a VALUE (yielded from scf.if, stored to
-    # an array, passed on): materialise its fields into `vector<N×T>`.
+    # A struct `:new` used as a VALUE (yielded from scf.if, stored to an array,
+    # passed on): homogeneous → `vector<N×T>`; heterogeneous → `!llvm.struct`.
     if op isa SSAValue && haskey(lc.new_structs, op.id)
         (T, ops) = lc.new_structs[op.id]
-        if _struct_vec_info(T) !== nothing
+        if _struct_vec_info(T) !== nothing || _hetero_struct_info(T) !== nothing
             elems = IR.Value[]
             for o in ops
                 fv = resolve_value_or_const(lc, o)
                 fv === nothing && error("struct field unresolved: $o")
                 push!(elems, fv)
             end
-            return IR.result(_vector.from_elements(elems; result=mlir_elem_type(T)))
+            return _struct_vec_info(T) !== nothing ?
+                IR.result(_vector.from_elements(elems; result=mlir_elem_type(T))) :
+                _llvm_struct_assemble!(elems)
         end
     end
     # A homogeneous-struct ARG used as a whole value: reconstruct the
@@ -1235,11 +1337,10 @@ function resolve_value_or_const(lc::LowerCtx, @nospecialize(op))
         v = _reconstruct_struct_arg!(lc, op.n, lc.struct_arg_types[op.n])
         v === nothing || return v
     end
-    # A tracked tuple (`Core.tuple`) used as a whole value — e.g. a
-    # `Tuple{T,T}` reduction result stored into a struct array. If its
-    # components resolve to one common scalar type, it's `vector<N×T>`-able
-    # (same representation as a homogeneous struct); materialise via
-    # `vector.from_elements`. (Heterogeneous tuples remain a future gap.)
+    # A tracked tuple (`Core.tuple`) used as a whole value — e.g. a reduction
+    # result stored into a struct array. Components of one common scalar type →
+    # `vector<N×T>` (homogeneous, e.g. extrema's `Tuple{T,T}`); mixed types →
+    # `!llvm.struct` (heterogeneous, e.g. findmax's `Tuple{Float32,Int64}`).
     if op isa SSAValue && haskey(lc.tuples, op.id)
         comps = lc.tuples[op.id]
         if !isempty(comps)
@@ -1251,10 +1352,10 @@ function resolve_value_or_const(lc::LowerCtx, @nospecialize(op))
             end
             if length(elems) == length(comps)
                 t0 = IR.type(elems[1])
-                if all(e -> IR.type(e) == t0, elems)
-                    return IR.result(_vector.from_elements(elems;
-                        result=IR.VectorType(1, Int[length(elems)], t0)))
-                end
+                return all(e -> IR.type(e) == t0, elems) ?
+                    IR.result(_vector.from_elements(elems;
+                        result=IR.VectorType(1, Int[length(elems)], t0))) :
+                    _llvm_struct_assemble!(elems)
             end
         end
     end
@@ -1507,6 +1608,12 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
         # CPU SPMD path (or no ndrange info): every lane valid.
         return IR.result(_arith.constant(;
             value=IR.Attribute(true, IR.Type(Bool)), result=IR.Type(Bool)))
+    end
+
+    # `Base.fpiseq(x,y)` (float `isequal`, from findmax/argmax tie-breaks) reaches
+    # us as a plain function call, not an inlined intrinsic.
+    if fname === :fpiseq && length(args) == 2
+        return emit_fpiseq!(lc, args, typ)
     end
 
     # Named transcendental / rounding math functions reached as plain Julia calls
@@ -1814,6 +1921,7 @@ function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecializ
     name === :eq_int  && return emit_cmpi!(lc, Any[args[1], args[2], CP.Equal, SG.Signed], typ)
     name === :ne_int  && return emit_cmpi!(lc, Any[args[1], args[2], CP.NotEqual, SG.Signed], typ)
     name === Symbol("===") && return emit_egal!(lc, args, typ)
+    name === :fpiseq && return emit_fpiseq!(lc, args, typ)
     # Float comparisons → emit_cmpf!.
     name === :lt_float && return emit_cmpf!(lc, Any[args[1], args[2], CP.LessThan], typ)
     name === :le_float && return emit_cmpf!(lc, Any[args[1], args[2], CP.LessThanOrEqual], typ)
@@ -2023,6 +2131,28 @@ function emit_egal!(lc::LowerCtx, args, @nospecialize(typ))
     pred = IR.Attribute(cmpi_predicate_code(ComparisonPredicate.Equal, Signedness.Signed),
                         IR.Type(Int64))
     return IR.result(_arith.cmpi(a, b; predicate=pred))
+end
+
+# `Base.fpiseq(x, y)` — float `isequal`: bit-egal OR both-NaN (used by
+# findmax/argmax tie-breaks). Emit `(bits(x)==bits(y)) | (isnan(x) & isnan(y))`;
+# `isnan(z)` is `arith.cmpf "uno" z, z` (predicate code 14).
+function emit_fpiseq!(lc::LowerCtx, args, @nospecialize(typ))
+    a = resolve_value_or_const(lc, args[1])
+    b = resolve_value_or_const(lc, args[2])
+    (a === nothing || b === nothing) &&
+        error("fpiseq: unresolved operands ($(args[1]), $(args[2]))")
+    a, b = _spmd_harmonise(lc, a, b)
+    uno = IR.Attribute(14, IR.Type(Int64))                  # arith CmpFPredicate UNO
+    nan_a = IR.result(_arith.cmpf(a, a; predicate=uno))
+    nan_b = IR.result(_arith.cmpf(b, b; predicate=uno))
+    bothnan = IR.result(_arith.andi(nan_a, nan_b))
+    ai = _bitcast_float_to_int!(a)
+    bi = _bitcast_float_to_int!(b)
+    ai, bi = _harmonise_binop_widths(ai, bi, nothing)
+    eqp = IR.Attribute(cmpi_predicate_code(ComparisonPredicate.Equal, Signedness.Signed),
+                       IR.Type(Int64))
+    egal = IR.result(_arith.cmpi(ai, bi; predicate=eqp))
+    return IR.result(_arith.ori(egal, bothnan))
 end
 
 function emit_cmpi!(lc::LowerCtx, args, @nospecialize(typ))
@@ -2235,15 +2365,24 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
     # struct accumulator, e.g. a `Tuple{T,T}` extrema state) carries its type.
     svT = obj isa SSAValue && haskey(lc.struct_vals, obj.id) ? lc.struct_vals[obj.id] :
           obj isa BlockArgument && obj.type isa Type &&
-              _struct_vec_info(obj.type) !== nothing ? obj.type : nothing
+              (_struct_vec_info(obj.type) !== nothing ||
+               _hetero_struct_info(obj.type) !== nothing) ? obj.type : nothing
     if svT !== nothing
         vec = resolve_value_or_const(lc, obj)
         vec === nothing && error("getfield: unresolved struct value $obj")
         fld = args[2] isa QuoteNode ? args[2].value : args[2]
         fi = fld isa Symbol ? Base.fieldindex(svT, fld) : Int(fld)
-        pos = IR.result(_arith.constant(;
-                  value=IR.Attribute(fi - 1, IR.IndexType()), result=IR.IndexType()))
-        return IR.result(_vector.extractelement(vec, pos; result=eltype(IR.type(vec))))
+        if _struct_vec_info(svT) !== nothing
+            # homogeneous → `vector.extractelement`
+            pos = IR.result(_arith.constant(;
+                      value=IR.Attribute(fi - 1, IR.IndexType()), result=IR.IndexType()))
+            return IR.result(_vector.extractelement(vec, pos; result=eltype(IR.type(vec))))
+        else
+            # heterogeneous → `llvm.extractvalue` at the field's struct position
+            FT = fieldtype(svT, fi)
+            return IR.result(_llvm.extractvalue(vec;
+                res=mlir_elem_type(FT), position=IR.Attribute(Int64[fi - 1])))
+        end
     end
     if obj isa Argument
         field = args[2]
@@ -2535,9 +2674,11 @@ function if_result_types(@nospecialize(typ))
             pt = reduce(promote_type, members)
             push!(jls, pt)
             push!(rts, mlir_elem_type(pt))
-        elseif p isa Type && (p <: Number || _struct_vec_info(p) !== nothing)
-            # Scalar numeric OR a homogeneous-struct value (a `vector<N×T>`, e.g.
-            # a `Complex`/`Point` loaded from an array and yielded from a branch).
+        elseif p isa Type && (p <: Number || _struct_vec_info(p) !== nothing ||
+                              _hetero_struct_info(p) !== nothing)
+            # Scalar numeric, a homogeneous-struct value (`vector<N×T>`, e.g.
+            # `Complex`/`Point`), or a heterogeneous struct (`!llvm.struct`, e.g.
+            # a `findmax` `(value,index)` accumulator carried through the branch).
             push!(jls, p)
             push!(rts, mlir_elem_type(p))
         else
@@ -2676,7 +2817,8 @@ function _emit_loop_region!(lc::LowerCtx, block::Block, carried::Vector{IR.Type}
     i1 = IR.Type(Bool)
     _walk(idx, e) = (v = walk_stmt!(lc, idx, e.stmt, e.type);
         v === nothing || (lc.ssa_vals[idx] = v;
-            e.type isa Type && _struct_vec_info(e.type) !== nothing && (lc.struct_vals[idx] = e.type)))
+            e.type isa Type && (_struct_vec_info(e.type) !== nothing ||
+                _hetero_struct_info(e.type) !== nothing) && (lc.struct_vals[idx] = e.type)))
     term = block.terminator
     if term isa ContinueOp || term isa BreakOp
         for (idx, e) in block.body; _walk(idx, e); end
@@ -3066,7 +3208,7 @@ function emit_local_buffer!(lc::LowerCtx, idx::Int, args, shared::Bool)
            (vd isa Type && vd <: Val) ? vd.parameters[1] :
            error("$what: dims must be Val{Dims}, got $vd")
     dims = Tuple(Dims)
-    elem = mlir_elem_type(T)
+    elem = mlir_memref_elem_type(T)
     shape = Int[reverse(dims)...]
     if shared && lc.lane_width == 1
         # GPU @localmem: a workgroup-space `memref.global` sibling of the
@@ -3401,6 +3543,14 @@ function emit_spmd_memoryrefget!(lc::LowerCtx, args, @nospecialize(typ))
     mr_ref isa SSAValue && haskey(lc.offsets, mr_ref.id) ||
         error("SPMD memoryrefget: mr operand must be a tracked memoryrefnew SSA, got $mr_ref")
     off = lc.offsets[mr_ref.id]
+    # Heterogeneous struct element: load the `!llvm.struct` via a GEP'd `!llvm.ptr`
+    # (memref can't hold the aggregate). Lane-scalar path only (GPU).
+    if _hetero_struct_info(off.elem_type) !== nothing
+        isempty(off.idx_shape) ||
+            error("SPMD memoryrefget: heterogeneous-struct gather not supported")
+        ep, st = _hetero_elem_ptr!(off.base, off.indices, off.elem_type)
+        return IR.result(_llvm.load(ep; res=st))
+    end
     if isempty(off.idx_shape)
         # Scalar load — `memref.load %base[%idx]`.
         idx_index = cast_to_index(off.indices)
@@ -3443,6 +3593,14 @@ function emit_spmd_memoryrefset!(lc::LowerCtx, args, @nospecialize(typ))
     val_v = resolve_value_or_const(lc, args[2])
     val_v === nothing &&
         error("SPMD memoryrefset!: cannot resolve value operand $(args[2])")
+    # Heterogeneous struct element: store the `!llvm.struct` via a GEP'd `!llvm.ptr`.
+    if _hetero_struct_info(off.elem_type) !== nothing
+        isempty(off.idx_shape) ||
+            error("SPMD memoryrefset!: heterogeneous-struct scatter not supported")
+        ep, _ = _hetero_elem_ptr!(off.base, off.indices, off.elem_type)
+        _llvm.store(val_v, ep)
+        return nothing
+    end
     # Coerce the value to the array's element type if it differs — e.g. a value
     # promoted from a numeric union (`scf.if` across Int32/Int64 branches) stored
     # into a narrower array. This is Julia's implicit `convert` at the store,
