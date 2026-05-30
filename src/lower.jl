@@ -46,6 +46,19 @@ struct OffsetInfo
     idx_shape::Vector{Int}
 end
 
+# Worklist for outlined calls: an `:invoke` the walker can't special-case is
+# emitted as a `func.call` to a `func.func` lowered from the callee's IR. `funcs`
+# dedups per (MethodInstance signature) → symbol; `queue` holds the (signature,
+# symbol) pairs still to emit. Shared across the kernel + all outlined funcs.
+# Drained in `lower_to_mlir_gpu` (draining may enqueue more). See
+# [[reference_outlined_call_design]].
+mutable struct OutlineState
+    funcs::Dict{Any, String}
+    queue::Vector{Tuple{Any, String}}
+    counter::Int
+end
+OutlineState() = OutlineState(Dict{Any, String}(), Tuple{Any, String}[], 0)
+
 mutable struct LowerCtx
     ctx::IR.Context
     mod::IR.Module
@@ -138,6 +151,8 @@ mutable struct LowerCtx
     # `captured`); using the WHOLE arg as a value reconstructs the vector from
     # those scalar slots (see `resolve_value_or_const`).
     struct_arg_types::Dict{Int, Type}
+    # Outlined-call worklist (shared across kernel + outlined funcs).
+    outline::OutlineState
 end
 
 LowerCtx(ctx, mod) = LowerCtx(
@@ -155,7 +170,7 @@ LowerCtx(ctx, mod) = LowerCtx(
     Dict{Tuple{Int, Tuple}, Tuple{Int, Symbol}}(), Set{Int}(),
     Dict{Int, Tuple{Int, Tuple}}(), Dict{Int, Int}(),
     Dict{Int, Tuple{Any, Vector{Any}}}(), Dict{Int, Any}(),
-    Dict{Int, Type}(), Dict{Int, Type}())
+    Dict{Int, Type}(), Dict{Int, Type}(), OutlineState())
 
 # ----------------------------------------------------------------------------
 # Type translation: Julia → MLIR
@@ -1101,6 +1116,13 @@ function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
                     _gpu.return_(IR.Value[])
                 end
             end
+            # Drain the outlined-call worklist: each queued callee → a `func.func`
+            # sibling of the gpu.func in the gpu.module (emission may enqueue more).
+            # MLIR `-inline` (prepended to GPU_PASSES) splices/cleans them up.
+            while !isempty(lc.outline.queue)
+                (cmi, csym) = popfirst!(lc.outline.queue)
+                _emit_outlined_func!(lc, cmi, csym)
+            end
         end
     end
     return (mod_ref[], param_julia_types, ctx, param_kinds)
@@ -1122,7 +1144,8 @@ end
 # care (currently unused; we emit the terminator op inline).
 function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
                      yield_types::Vector{Type}=Type[],
-                     carried_types::Vector{IR.Type}=IR.Type[])
+                     carried_types::Vector{IR.Type}=IR.Type[],
+                     func_ret_type::Vector{IR.Type}=IR.Type[])
     for (idx, entry) in block
         stmt = entry.stmt
         typ  = entry.type
@@ -1228,6 +1251,22 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
         end
         _scf.yield(vals)
         return
+    elseif kind === :func
+        # Outlined device-function body: `return v` → `func.return v` (or no
+        # operand for a `Nothing`/`return`). `func_ret_type` is the (single) MLIR
+        # result type, or `nothing` for a void function.
+        if term isa Core.ReturnNode && isdefined(term, :val)
+            rv = resolve_value_or_const(lc, term.val)
+            if rv === nothing
+                _func.return_(IR.Value[])
+            else
+                isempty(func_ret_type) || (rv = _coerce_to_type!(rv, func_ret_type[1]))
+                _func.return_(IR.Value[rv])
+            end
+        else
+            _func.return_(IR.Value[])
+        end
+        return
     end
 end
 
@@ -1283,7 +1322,9 @@ function walk_expr!(lc::LowerCtx, idx::Int, e::Expr, @nospecialize(typ))
     if e.head === :call
         return walk_call!(lc, idx, e.args[1], e.args[2:end], typ)
     elseif e.head === :invoke
-        return walk_call!(lc, idx, e.args[2], e.args[3:end], typ)
+        # e.args[1] is the callee MethodInstance/CodeInstance — thread it so an
+        # un-dispatchable invoke can be emitted as an outlined `func.call`.
+        return walk_call!(lc, idx, e.args[2], e.args[3:end], typ; mi=e.args[1])
     elseif e.head === :boundscheck
         # Synthetic bool used as the 3rd `getfield` arg (`@inbounds` hint).
         # Tag the SSA as a sentinel; subsequent getfield call recognises it.
@@ -1489,7 +1530,7 @@ end
 
 
 function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
-                    args::Vector{Any}, @nospecialize(typ))
+                    args::Vector{Any}, @nospecialize(typ); mi=nothing)
     fname = callee_name(callee)
 
     if fname === :tuple
@@ -1703,8 +1744,114 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
         end
     end
 
+    # Un-dispatchable `:invoke` (a statically-resolved MethodInstance the walker
+    # has no special case for — e.g. a closure Julia's inliner declined). Emit an
+    # outlined `func.call` and queue the callee for lowering. (Dynamic dispatch —
+    # a `:call` to a runtime value — has no MI and still errors.)
+    if mi !== nothing
+        return emit_outlined_call!(lc, idx, mi, callee, args, typ)
+    end
     error("MLIRKernels.walk_call!: unhandled callee $fname " *
           "(callee=$callee, args=$args)")
+end
+
+# ----------------------------------------------------------------------------
+# Outlined calls: lower an un-inlined `:invoke` to a `func.call` + a `func.func`
+# (emitted from the callee's IR via a worklist). See [[reference_outlined_call_design]].
+# ----------------------------------------------------------------------------
+
+# A MethodInstance argument is a "value" param iff it carries runtime data — i.e.
+# NOT a singleton/`Const` (a captureless function or a `Val`/`Type`, which vanish).
+_outline_is_value_arg(@nospecialize(AT)) =
+    !(AT isa Core.Const) && !(AT isa Type && Base.issingletontype(AT)) &&
+    !(AT isa Type && AT <: Type)
+
+# Normalise a CodeInstance/MethodInstance to its `MethodInstance` + signature.
+function _outline_mi(@nospecialize(ci))
+    mi = ci isa Core.MethodInstance ? ci :
+         isdefined(ci, :def) && ci.def isa Core.MethodInstance ? ci.def :
+         error("outlined call: cannot get MethodInstance from $ci")
+    return mi, mi.specTypes
+end
+
+# Emit `func.call @outlined(operands…)` for an un-dispatchable `:invoke`, queueing
+# the callee for `func.func` emission (deduped per signature).
+function emit_outlined_call!(lc::LowerCtx, idx::Int, @nospecialize(ci),
+                             @nospecialize(callee), args, @nospecialize(typ))
+    mi, sig = _outline_mi(ci)
+    sym = get!(lc.outline.funcs, sig) do
+        lc.outline.counter += 1
+        s = "outlined_$(lc.outline.counter)"
+        push!(lc.outline.queue, (mi, s))
+        s
+    end
+    # Operands: the call's args in MI-signature order (callee = arg 1 = the
+    # function/closure, args[k] = arg k+1), keeping only the value (non-ghost)
+    # ones — matching the func.func's param list.
+    sigparams = collect(sig.parameters)
+    call_ops = Any[callee, args...]
+    operands = IR.Value[]
+    for (k, AT) in enumerate(sigparams)
+        _outline_is_value_arg(AT) || continue
+        v = resolve_value_or_const(lc, call_ops[k])
+        v === nothing && error("outlined call $sym: cannot resolve operand $(call_ops[k])::$AT")
+        push!(operands, v)
+    end
+    ret = (typ === Nothing || typ === Nothing) ? IR.Type[] : IR.Type[mlir_elem_type(typ)]
+    res = _func.call(operands; result_0=ret, callee=parse(IR.Attribute, "@" * sym))
+    return isempty(ret) ? nothing : IR.result(res)
+end
+
+# Lower a queued callee (MethodInstance `mi`, symbol `sym`) to a `func.func` in the
+# gpu.module. Reuses the walker; func-mode arg setup (no lane index). Value args
+# become params; ghost args (the captureless fn / Vals) are dropped (bound as
+# `arg_const` so the body can fold them). Draining may enqueue more callees.
+function _emit_outlined_func!(lc::LowerCtx, @nospecialize(mi), sym::String)
+    sig = mi.specTypes
+    interp = Frontend.FrontendInterpreter()
+    results = Base.code_ircode_by_type(sig; interp)
+    isempty(results) && error("outlined func $sym: inference produced no results for $sig")
+    ir, rettype = results[1]
+    sci = StructuredIRCode(ir)
+    SCIOpt.optimize_sci!(sci)
+    rt = Core.Compiler.widenconst(rettype)
+
+    cl = LowerCtx(lc.ctx, lc.mod)
+    cl.outline = lc.outline                 # share the worklist
+    cl.gpu_module_block = lc.gpu_module_block
+    cl.spmd = true; cl.lane_width = 1
+
+    # Classify args → params (value) / consts (ghost). SCI arg slots are 1-based.
+    param_types = IR.Type[]
+    param_slots = Int[]
+    for (i, AT) in enumerate(sci.argtypes)
+        ATw = Core.Compiler.widenconst(AT)
+        if AT isa Core.Const
+            cl.arg_const[i] = AT.val
+        elseif _outline_is_value_arg(AT) && ATw <: Number
+            push!(param_types, mlir_elem_type(ATw)); push!(param_slots, i)
+        elseif _outline_is_value_arg(AT)
+            error("outlined func $sym: non-scalar arg #$i::$ATw unsupported yet (captures)")
+        end
+        # singleton/Type ghost args: nothing to bind (never used at runtime).
+    end
+    ret_ts = (rt === Nothing) ? IR.Type[] : IR.Type[mlir_elem_type(rt)]
+    ftype = IR.FunctionType(param_types, ret_ts)
+
+    entry = IR.Block(param_types, [IR.Location() for _ in param_types])
+    fbody = IR.Region(); push!(fbody, entry)
+    @with_block lc.gpu_module_block begin
+        _func.func_(; sym_name=IR.Attribute(sym),
+                    function_type=IR.Attribute(ftype),
+                    sym_visibility=IR.Attribute("private"), body=fbody)
+    end
+    @with_block entry begin
+        for (k, slot) in enumerate(param_slots)
+            cl.arg_vals[slot] = IR.argument(entry, k)
+        end
+        walk_block!(cl, sci.entry; kind=:func, func_ret_type=ret_ts)
+    end
+    return nothing
 end
 
 # Plain-Julia unary math callees (`Base.sin` etc. that survive inference as a

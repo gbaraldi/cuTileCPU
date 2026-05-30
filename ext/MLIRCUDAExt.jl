@@ -165,6 +165,9 @@ end
 # ----------------------------------------------------------------------------
 
 const GPU_PASSES = String[
+    # Inline outlined device calls (func.call → func.func emitted for un-inlined
+    # `:invoke`s) and drop the now-unused func.funcs. No-op when there are none.
+    "inline", "symbol-dce",
     "nvvm-attach-target{chip=sm_90 features=+ptx80}",
     "gpu-kernel-outlining",
     "gpu.module(convert-gpu-to-nvvm)",

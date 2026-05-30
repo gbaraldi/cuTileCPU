@@ -199,6 +199,15 @@ end
     @inbounds out[i] = t[@inbounds ds[i]]
 end
 
+# `@noinline` keeps this a real `:invoke` (Julia's inliner can't fold it), so the
+# walker emits an OUTLINED `func.call` to a `func.func` lowered from its IR and
+# MLIR `-inline` splices it back. Exercises the outlined-call worklist.
+@noinline _g_poly(x::Float32) = x * x + 2f0 * x + 1f0
+@kernel function _g_outline!(out, @Const(a))
+    i = @index(Global, Linear)
+    @inbounds out[i] = _g_poly(a[i])
+end
+
 @testset "GPU: KA @kernel on MLIRCUDABackend (SIMT)" begin
     if !CUDA.functional()
         @info "CUDA not functional in this env — skipping GPU backend test"
@@ -360,6 +369,12 @@ end
         to = MLIRArray(CUDA.zeros(Int64, 3))
         _g_tupidx!(backend, 4)(to, ta, td; ndrange=3); CUDA.synchronize()
         @test Array(to) == [5, 10, 15]
+
+        # Outlined call: a `@noinline` callee → func.call to an emitted func.func,
+        # spliced back by MLIR `-inline`.
+        ox = rand(Float32, 64); oa = MLIRArray(CUDA.CuArray(ox)); oo = MLIRArray(CUDA.zeros(Float32, 64))
+        _g_outline!(backend, 64)(oo, oa; ndrange=64); CUDA.synchronize()
+        @test Array(oo) ≈ ox .^ 2 .+ 2 .* ox .+ 1
     end
 end
 
