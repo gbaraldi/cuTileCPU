@@ -73,6 +73,9 @@ mk(v) = MLIRArray(CUDA.CuArray(v))
         @test A(seq[10:20]) == collect(Float32, 10:20)            # getindex range
         @test A(vcat(a, b)) == vcat(A(a), A(b))                   # vcat
         let m = mk(rand(Float32, 16, 4)); @test A(hcat(m, m)) == hcat(A(m), A(m)); end
+        # repeat — its copy kernel uses a generic break-loop (LoopOp).
+        @test A(repeat(seq, 2)) == repeat(A(seq), 2)
+        let m = mk(rand(Float32, 4, 3)); @test A(repeat(m, 2, 1)) == repeat(A(m), 2, 1); end
 
         # Base reductions → GPUArrays.mapreducedim! → AcceleratedKernels' reduce.
         # `count`/`any`/`all` exercise the Bool→Int width coercion + the explicit
