@@ -185,6 +185,15 @@ end
     @inbounds out[i] = v % Int32
 end
 
+# Mixed-width UNSIGNED numeric union: `flag ? a[i]::UInt8 : UInt64(1)` promotes to
+# UInt64, so the UInt8 branch is widened. MLIR ints are signless, so the widening
+# must ZERO-extend (extui) — a sign-extend corrupts any value ≥ 128.
+@kernel function _g_uwiden!(out, @Const(a), flag::Bool)
+    i = @index(Global, Linear)
+    r = flag ? (@inbounds a[i]) : UInt64(1)
+    @inbounds out[i] = UInt64(r)
+end
+
 # Runtime dimension extent: `size(a, d)` with a runtime `d` reads
 # `getfield(a.size::Tuple, d)` with a non-const index → a select-chain over the
 # per-dim `memref.dim`s.
@@ -417,6 +426,10 @@ end
         uo2 = MLIRArray(CUDA.zeros(Int32, 64))
         _g_unionsel!(backend, 16)(uo2, ua, false; ndrange=64); CUDA.synchronize()
         @test all(Array(uo2) .== Int32(7))                     # union branch: Int64(7)%Int32
+        # unsigned mixed-width union → must zero-extend (extui), not sign-extend
+        uw = MLIRArray(CUDA.CuArray(UInt8[200, 5, 130, 255])); uwo = MLIRArray(CUDA.zeros(UInt64, 4))
+        _g_uwiden!(backend, 4)(uwo, uw, true; ndrange=4); CUDA.synchronize()
+        @test Array(uwo) == UInt64[200, 5, 130, 255]           # zero-extended, not 0xFF…C8
 
         # `size(a, d)` with a RUNTIME `d` — getfield(a.size, d) at a non-const
         # index → select-chain over memref.dims.

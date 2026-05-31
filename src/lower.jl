@@ -2296,7 +2296,7 @@ end
 # Coerce a numeric Value to `target_T`'s MLIR type (vector-aware). Used when an
 # scf.if yields a numeric *union* across branches (e.g. `init=0::Int64` mixed
 # with an `Int32` array): the branches are promoted to a common type, so each
-# branch's yield must be widened/converted to it. Signed integers assumed.
+# branch's yield must be widened/converted to it.
 function _coerce_numeric!(v::IR.Value, target_T::Type)
     out_t = _conv_out_type(v, target_T)
     IR.type(v) == out_t && return v
@@ -2304,8 +2304,12 @@ function _coerce_numeric!(v::IR.Value, target_T::Type)
     dst_int = target_T <: Integer
     if src_int && dst_int
         wv, wt = _int_width(IR.type(v)), _int_width(out_t)
-        return wt > wv ? IR.result(_arith.extsi(v; out=out_t)) :
-               wt < wv ? IR.result(_arith.trunci(v; out=out_t)) : v
+        # Widen: ZERO-extend an unsigned target, SIGN-extend a signed one. MLIR
+        # integers are signless, so the Julia `target_T` carries the signedness —
+        # `extsi` for unsigned silently corrupts the high bits of any value ≥ 2^(w-1).
+        wt > wv && return target_T <: Unsigned ?
+            IR.result(_arith.extui(v; out=out_t)) : IR.result(_arith.extsi(v; out=out_t))
+        return wt < wv ? IR.result(_arith.trunci(v; out=out_t)) : v
     elseif src_int          # int → float
         return IR.result(_arith.sitofp(v; out=out_t))
     elseif dst_int          # float → int
@@ -2317,9 +2321,13 @@ function _coerce_numeric!(v::IR.Value, target_T::Type)
     end
 end
 
-# Coerce `v` to a target MLIR type (scalar, signed-int assumed). Used at scf
-# control-flow edges (while carried values) where the target is an MLIR type
-# rather than a Julia type. No-op when already matching; leaves non-numerics be.
+# Coerce `v` to a target MLIR type. Used at scf control-flow edges (while carried
+# values) where the target is a signless MLIR type rather than a Julia type — so it
+# can't know signedness and SIGN-extends on widening. Correct for signed ints (the
+# usual carried accumulators); a narrow gap remains for an UNSIGNED value ≥ 2^(w-1)
+# carried across a while loop with width change (rare — the scf.if-yield path uses
+# `_coerce_numeric!`, which has the Julia type and zero-extends unsigned correctly).
+# No-op when already matching; leaves non-numerics be.
 function _coerce_to_type!(v::IR.Value, target_t::IR.Type)
     src = IR.type(v)
     src == target_t && return v
