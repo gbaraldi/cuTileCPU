@@ -292,6 +292,24 @@ end
     out[i] = acc
 end
 
+# An EXPLICIT throw inside a counted for-loop, with a carried accumulator used
+# after the loop. IRStructurizer keeps the loop-exit throw (a `…; throw::Union{};
+# ReturnNode()` arm) instead of dropping it to a bare break, and the loop lowering
+# treats that divergent arm as a control transfer (emit_exception! + poison-yield).
+# Good input sums correctly; a negative element raises a KernelException.
+@kernel function _g_loopthrow!(out, @Const(a), n)
+    i = @index(Global, Linear)
+    acc = zero(eltype(out))
+    for k in 1:n
+        x = @inbounds a[k]
+        if x < zero(eltype(out))
+            throw(DomainError(x, "neg"))
+        end
+        acc += x
+    end
+    @inbounds out[i] = acc
+end
+
 @testset "GPU: KA @kernel on MLIRCUDABackend (SIMT)" begin
     if !CUDA.functional()
         @info "CUDA not functional in this env — skipping GPU backend test"
@@ -529,6 +547,20 @@ end
             loob = MLIRArray(CUDA.zeros(Float32, L))
             @test_throws CUDA.CUDACore.KernelException begin
                 _g_loopchk!(backend, L)(loob, la, L + 5; ndrange=L); CUDA.synchronize()
+            end
+        end
+
+        # Explicit throw INSIDE a counted for-loop (+ carried accumulator used after).
+        # Good input sums; a negative element raises a KernelException.
+        let L = 8
+            ta = MLIRArray(CUDA.CuArray(collect(Float32, 1:L)))
+            to = MLIRArray(CUDA.zeros(Float32, L))
+            _g_loopthrow!(backend, L)(to, ta, L; ndrange=L); CUDA.synchronize()
+            @test all(Array(to) .≈ sum(1:L))                  # good input, looped + accumulated
+            badv = collect(Float32, 1:L); badv[3] = -5f0
+            tbad = MLIRArray(CUDA.CuArray(badv)); tbo = MLIRArray(CUDA.zeros(Float32, L))
+            @test_throws CUDA.CUDACore.KernelException begin
+                _g_loopthrow!(backend, L)(tbo, tbad, L; ndrange=L); CUDA.synchronize()
             end
         end
     end

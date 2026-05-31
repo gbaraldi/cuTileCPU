@@ -3336,7 +3336,18 @@ end
 # `yield`.) Used to find the control-transfer statement in a LoopOp body.
 function _is_loop_control_region(b::Block)
     b.terminator isa Union{ContinueOp, BreakOp} && return true
-    b.terminator === nothing || return false
+    # A divergent throw/unreachable branch (`ReturnNode()` with no value, emitted by
+    # IRStructurizer for a throw INSIDE the loop) also transfers control out — the
+    # thread throws/exits, never falling through to the loop's yield.
+    (b.terminator isa Core.ReturnNode && !isdefined(b.terminator, :val)) && return true
+    # A region also transfers control when its last STATEMENT is a control-`if`
+    # (every path through it breaks/continues), even if a DEAD `yield` terminator
+    # follows. The structurizer emits this for a conditional break whose other
+    # branch continues the loop — `if cond { break } else { …; iterate-control-if }`
+    # — making the throwing `else`'s control-if a sibling of an unreachable yield.
+    # Look past such a dead `yield` to the last control-if. (A genuine value-`if`
+    # ends its branches in yields, not transfers, so it's still rejected.)
+    (b.terminator === nothing || b.terminator isa YieldOp) || return false
     last_stmt = nothing
     for (_, e) in b.body; last_stmt = e.stmt; end
     last_stmt isa IfOp &&
@@ -3365,6 +3376,16 @@ function _emit_loop_region!(lc::LowerCtx, block::Block, carried::Vector{IR.Type}
         end
         push!(out, IR.result(_arith.constant(;
             value=IR.Attribute(term isa BreakOp, i1), result=i1)))
+        return out
+    elseif term isa Core.ReturnNode && !isdefined(term, :val)
+        # A divergent throw/unreachable arm inside the loop (a `throw` IRStructurizer
+        # kept as `…; throw::Union{}; ReturnNode()`). Walk its statements — the
+        # `throw` lowers to `emit_exception!` (signal + `nvvm.exit`), retiring the
+        # thread. The carried/`done` values are never observed (the thread exited),
+        # so yield poison of the carried types + `done=true`.
+        for (idx, e) in block.body; _walk(idx, e); end
+        out = IR.Value[IR.result(_llvm.mlir_undef(; res=t)) for t in carried]
+        push!(out, IR.result(_arith.constant(; value=IR.Attribute(true, i1), result=i1)))
         return out
     end
     # terminator === nothing: the last statement is the control-`if`. Lower the
