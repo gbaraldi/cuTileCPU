@@ -158,6 +158,21 @@ mk(v) = MLIRArray(CUDA.CuArray(v))
             @test A(rv) == ev
             @test A(ri) == ei            # CartesianIndex{3} array
         end
+
+        # permutedims: GPUArrays' kernel uses `@index(Global, Linear)` with a
+        # MULTI-DIM `ndrange = size(dest)`. The global linear index must linearise
+        # COLUMN-MAJOR over ALL ndrange dims — an x-only index left every dim>1
+        # thread aliasing dim 1, writing only the first `size(dest,1)` elements
+        # (a silent wrong result). 2-D non-square, larger 2-D, and 3-D perms.
+        let P = reshape(collect(Float32, 1:6), 2, 3)
+            @test A(permutedims(mk(P))) == permutedims(P)
+        end
+        let M = rand(Float32, 5, 7)
+            @test A(permutedims(mk(M))) == permutedims(M)
+        end
+        let C = rand(Float32, 2, 3, 4)
+            @test A(permutedims(mk(C), (3, 1, 2))) == permutedims(C, (3, 1, 2))
+        end
     end
 end
 

@@ -1119,20 +1119,39 @@ function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
                 end
 
                 @with_block entry begin
-                    # gid = thread_id.x + block_id.x * block_dim.x + 1
-                    dimx = parse(IR.Attribute, "#gpu<dim x>")
-                    tid  = IR.result(_gpu.thread_id(; result_0=idx_t, dimension=dimx))
-                    bid  = IR.result(_gpu.block_id(; result_0=idx_t, dimension=dimx))
-                    bdim = IR.result(_gpu.block_dim(; result_0=idx_t, dimension=dimx))
-                    off  = IR.result(_arith.muli(bid, bdim; result=idx_t))
-                    gid_idx = IR.result(_arith.addi(off, tid; result=idx_t))
+                    # The global LINEAR index (KA `@index(Global, Linear)`), 1-based.
+                    # COLUMN-MAJOR linearisation over ALL ndrange dims:
+                    #   gid = 1 + g_0 + g_1·nd[1] + g_2·nd[1]·nd[2] + …,  g_d = block_id.d·block_dim.d + thread_id.d
+                    # so a Linear-index kernel launched with a MULTI-DIM ndrange
+                    # (e.g. GPUArrays' permutedims, `ndrange = size(dest)`) spans the
+                    # whole iteration space — not just dim x. For a 1-D ndrange this
+                    # reduces to `block_id.x·block_dim.x + thread_id.x + 1`. Tail
+                    # threads beyond the ndrange are masked by `valid_index`.
+                    gdims = max(1, length(lc.nd_dims))
+                    dimattrs = ("#gpu<dim x>", "#gpu<dim y>", "#gpu<dim z>")
+                    local lin, stride, bidx
+                    for d in 1:gdims
+                        da   = parse(IR.Attribute, dimattrs[d])
+                        tid  = IR.result(_gpu.thread_id(; result_0=idx_t, dimension=da))
+                        bid  = IR.result(_gpu.block_id(; result_0=idx_t, dimension=da))
+                        bdim = IR.result(_gpu.block_dim(; result_0=idx_t, dimension=da))
+                        off  = IR.result(_arith.muli(bid, bdim; result=idx_t))
+                        gd   = IR.result(_arith.addi(off, tid; result=idx_t))  # 0-based dim-d global index
+                        d == 1 && (bidx = bid)                                 # lc.bids[1] = x block_id
+                        contrib = d == 1 ? gd : IR.result(_arith.muli(gd, stride; result=idx_t))
+                        lin = d == 1 ? contrib : IR.result(_arith.addi(lin, contrib; result=idx_t))
+                        if d < gdims      # advance the column-major stride for the next dim
+                            nddim = IR.result(_arith.constant(; value=IR.Attribute(lc.nd_dims[d], idx_t)))
+                            stride = d == 1 ? nddim : IR.result(_arith.muli(stride, nddim; result=idx_t))
+                        end
+                    end
                     one_idx = IR.result(_arith.constant(; value=IR.Attribute(Int(1), idx_t)))
-                    gid1_idx = IR.result(_arith.addi(gid_idx, one_idx; result=idx_t))
+                    gid1_idx = IR.result(_arith.addi(lin, one_idx; result=idx_t))
                     # Cast to the lane integer type (e.g. i32) — matches the
                     # kernel's `gid::Int32` so the `gid <= n` cmpi is well-typed.
                     gid_int = IR.result(_arith.index_cast(gid1_idx; out=lane_t))
                     lc.arg_vals[lane_slot] = gid_int
-                    push!(lc.bids, bid)
+                    push!(lc.bids, bidx)
 
                     walk_block!(lc, sci.entry)
                     _gpu.return_(IR.Value[])
