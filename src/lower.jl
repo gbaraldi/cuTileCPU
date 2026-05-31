@@ -162,6 +162,12 @@ mutable struct LowerCtx
     # the `@__mlirkernels_exc`-emitted flag (`outline.exc_global`), shared so the
     # exception global is emitted exactly once across the kernel + all outlined funcs.
     outline::OutlineState
+    # Set (dynamically scoped) while lowering an ENABLED bounds check whose body is
+    # inside a loop: the OOB path is a `break` out of the loop to a post-loop
+    # `throw_boundserror`, so a `break`/`continue` encountered here is lowered to
+    # `emit_exception!` (a `nvvm.exit` halt) directly — equivalent, and it keeps the
+    # enclosing `scf.for`/loop break-free. See emit_if!/walk_block!(:if).
+    bc_break_throws::Bool
 end
 
 LowerCtx(ctx, mod) = LowerCtx(
@@ -179,7 +185,7 @@ LowerCtx(ctx, mod) = LowerCtx(
     Dict{Tuple{Int, Tuple}, Tuple{Int, Symbol}}(), Set{Int}(),
     Dict{Int, Tuple{Int, Tuple}}(), Dict{Int, Int}(),
     Dict{Int, Tuple{Any, Vector{Any}}}(), Dict{Int, Any}(),
-    Dict{Int, Type}(), Dict{Int, Type}(), OutlineState())
+    Dict{Int, Type}(), Dict{Int, Type}(), OutlineState(), false)
 
 # ----------------------------------------------------------------------------
 # Type translation: Julia → MLIR
@@ -1226,6 +1232,16 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
             return
         elseif term === nothing
             _scf.yield(IR.Value[])
+            return
+        elseif (term isa BreakOp || term isa ContinueOp) && lc.bc_break_throws
+            # The OOB exit of an enabled bounds check INSIDE a loop: the structurizer
+            # `break`s out to a post-loop `throw_boundserror`. Signal the exception
+            # right here (`emit_exception!` → `nvvm.exit`) — equivalent (the host
+            # raises a `KernelException` either way) and it leaves the enclosing
+            # `scf.for`/loop break-free. The break is dead after the exit, so yield
+            # poison for the IfOp's result arity.
+            emit_exception!(lc)
+            _scf.yield(IR.Value[undef_value(lc, T) for T in yield_types])
             return
         else
             error("walk_block!(:if): unexpected terminator $(typeof(term))")
@@ -3034,20 +3050,16 @@ function emit_if!(lc::LowerCtx, idx::Int, op::IfOp, @nospecialize(typ))
     #   • `:boundscheck_on` — a checked access → drive the condition `true` so the
     #     check RUNS; an OOB index then `throw_boundserror`s → `emit_exception!` →
     #     a host `KernelException` (matching `@inbounds`-respecting CUDA.jl).
-    # CAVEAT: a checked access inside a LOOP makes the throw-branch terminate in a
-    # `BreakOp` that `walk_block!(:if)` can't yet lower — such kernels error rather
-    # than miscompile. `@inbounds` accesses (the common case for KA/AK/GPUArrays)
-    # fold to `:boundscheck` and are unaffected.
+    # A checked access INSIDE a loop has its OOB path structured as a `break` out of
+    # the loop to a post-loop `throw_boundserror`; we lower that `break` straight to
+    # `emit_exception!` (set `lc.bc_break_throws` for the region walk below — see
+    # walk_block!(:if)), which halts the thread (`nvvm.exit`) — equivalent to the
+    # break-then-throw, and it keeps the enclosing `scf.for` break-free. `@inbounds`
+    # accesses (the common case for KA/AK/GPUArrays) fold to `:boundscheck`.
     bc = (lc.spmd && op.condition isa SSAValue) ?
          get(lc.sentinels, op.condition.id, nothing) : nothing
     bc === :boundscheck && return nothing          # @inbounds → drop the check
-    # A checked access whose check body transfers loop control (a `break` for the
-    # OOB-throws-after-the-loop shape) can't be threaded yet → drop it too (sound:
-    # no check, never a crash). Otherwise enable: drive the condition `true`.
-    bc === :boundscheck_on &&
-        (_region_has_loop_control(op.then_region) ||
-         _region_has_loop_control(op.else_region)) && return nothing
-    cond_v = if bc === :boundscheck_on             # checked, non-loop → enable
+    cond_v = if bc === :boundscheck_on             # checked → enable (drive true)
         IR.result(_arith.constant(; value=IR.Attribute(true, IR.Type(Bool)), result=IR.Type(Bool)))
     else
         resolve_value_or_const(lc, op.condition)
@@ -3096,11 +3108,20 @@ function emit_if!(lc::LowerCtx, idx::Int, op::IfOp, @nospecialize(typ))
     push!(then_region, then_block)
     push!(else_region, else_block)
 
-    @with_block then_block begin
-        walk_block!(lc, op.then_region; kind=:if, yield_types=jl_yield_types)
-    end
-    @with_block else_block begin
-        walk_block!(lc, op.else_region; kind=:if, yield_types=jl_yield_types)
+    # While lowering an enabled bounds check, a `break`/`continue` in its body is
+    # the OOB exit → `emit_exception!` (see walk_block!(:if)). Dynamically scoped so
+    # nested non-check breaks elsewhere are unaffected.
+    prev_bc = lc.bc_break_throws
+    bc === :boundscheck_on && (lc.bc_break_throws = true)
+    try
+        @with_block then_block begin
+            walk_block!(lc, op.then_region; kind=:if, yield_types=jl_yield_types)
+        end
+        @with_block else_block begin
+            walk_block!(lc, op.else_region; kind=:if, yield_types=jl_yield_types)
+        end
+    finally
+        lc.bc_break_throws = prev_bc
     end
 
     ifop = _scf.if_(cond_v; results=result_types,
@@ -3263,30 +3284,6 @@ function _is_loop_control_region(b::Block)
     last_stmt isa IfOp &&
         _is_loop_control_region(last_stmt.then_region) &&
         _is_loop_control_region(last_stmt.else_region)
-end
-
-# True if `b` (or any region nested within it) transfers loop control
-# (`break`/`continue`). A bounds check INSIDE a loop represents its OOB throw as a
-# `break` out of the loop (+ a post-loop `throw_boundserror`); the generic
-# `walk_block!(:if)` can't thread that break, so `emit_if!` uses this to fall back
-# to dropping such a (would-be-enabled) check rather than crashing. Conservative:
-# recurses into every nested region, so it may also fire on an unrelated nested
-# loop — which only means a check is dropped (sound), never enabled-then-crashed.
-function _region_has_loop_control(b::Block)
-    b.terminator isa Union{ContinueOp, BreakOp} && return true
-    for (_, e) in b.body
-        st = e.stmt
-        if st isa IfOp
-            (_region_has_loop_control(st.then_region) ||
-             _region_has_loop_control(st.else_region)) && return true
-        elseif st isa ForOp || st isa LoopOp
-            _region_has_loop_control(st.body) && return true
-        elseif st isa WhileOp
-            (_region_has_loop_control(st.before) ||
-             _region_has_loop_control(st.after)) && return true
-        end
-    end
-    return false
 end
 
 # Lower a LoopOp body region (or a control-`if` branch) to the `(carried…, done)`

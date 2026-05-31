@@ -246,6 +246,18 @@ end
     c[i] = a[i + 1000000]        # non-@inbounds OOB read
 end
 
+# A checked access INSIDE a loop: its OOB path is a `break` out of the loop to a
+# post-loop `throw_boundserror`, threaded straight to `emit_exception!`. In-bounds
+# (n == length) sums correctly; OOB (n > length) raises a KernelException.
+@kernel function _g_loopchk!(out, @Const(a), n)
+    i = @index(Global, Linear)
+    acc = zero(eltype(out))
+    for k in 1:n
+        acc += a[k]              # non-@inbounds → checked, inside a loop
+    end
+    out[i] = acc
+end
+
 @testset "GPU: KA @kernel on MLIRCUDABackend (SIMT)" begin
     if !CUDA.functional()
         @info "CUDA not functional in this env — skipping GPU backend test"
@@ -453,6 +465,20 @@ end
             coob = MLIRArray(CUDA.zeros(Float32, N))
             @test_throws CUDA.CUDACore.KernelException begin
                 _g_chkoob!(backend, 64)(coob, ca; ndrange=N); CUDA.synchronize()
+            end
+        end
+
+        # Bounds check INSIDE a loop: the OOB `break`→post-loop-throw is threaded
+        # to emit_exception!, so the kernel compiles (scf.for, break-free) and the
+        # check runs. In-bounds sums correctly; OOB inside the loop raises.
+        let L = 8
+            la = MLIRArray(CUDA.CuArray(collect(Float32, 1:L)))
+            lo = MLIRArray(CUDA.zeros(Float32, L))
+            _g_loopchk!(backend, L)(lo, la, L; ndrange=L); CUDA.synchronize()
+            @test all(Array(lo) .≈ sum(1:L))                  # in-bounds, looped
+            loob = MLIRArray(CUDA.zeros(Float32, L))
+            @test_throws CUDA.CUDACore.KernelException begin
+                _g_loopchk!(backend, L)(loob, la, L + 5; ndrange=L); CUDA.synchronize()
             end
         end
     end
